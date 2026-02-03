@@ -167,3 +167,17 @@ class Supervisor:
             elif prog.name == name:
                 return old_proc.config != prog
         return False
+
+    def _acquire_pidfile_lock(self) -> None:
+        fd = os.open(self.config.pidfile, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as e:
+            os.close(fd)
+            msg = "Another supervice instance is already running (pidfile: %s)"
+            self.logger.critical(msg, self.config.pidfile)
+            raise RuntimeError(msg % self.config.pidfile) from e
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, str(os.getpid()).encode())
+        self._pidfile_fd = fd
