@@ -3,12 +3,14 @@ import fcntl
 import os
 import signal
 from dataclasses import replace
+
 from supervice.config import parse_config
 from supervice.events import EventBus
 from supervice.logger import get_logger, setup_logger
 from supervice.models import ProgramConfig, SupervisorConfig
 from supervice.process import Process
 from supervice.rpc import RPCServer
+
 
 class Supervisor:
     def __init__(self) -> None:
@@ -42,6 +44,7 @@ class Supervisor:
 
         self._create_processes(self.config.programs)
 
+    @staticmethod
     def _expand_logfile(path: str | None, process_num: int) -> str | None:
         if path is None:
             return None
@@ -195,3 +198,30 @@ class Supervisor:
                     os.remove(self.config.pidfile)
                 except OSError:
                     pass
+
+    async def shutdown(self) -> None:
+        self.logger.info("Shutting down...")
+
+        self._release_pidfile_lock()
+
+        if self.rpc_server:
+            await self.rpc_server.stop()
+        await self.event_bus.stop()
+
+        stop_tasks = []
+        for process in self.processes.values():
+            stop_tasks.append(process.stop())
+
+        if stop_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*stop_tasks, return_exceptions=True),
+                    timeout=self.config.shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "Shutdown timed out after %ds, some processes may not have stopped cleanly",
+                    self.config.shutdown_timeout,
+                )
+
+        self.logger.info("Shutdown complete")
