@@ -41,3 +41,8 @@ class Supervisor:
             raise
 
         self._create_processes(self.config.programs)
+
+    def _expand_logfile(path: str | None, process_num: int) -> str | None:
+        if path is None:
+            return None
+        return path.replace("%(process_num)s", "%02d" % process_num)
