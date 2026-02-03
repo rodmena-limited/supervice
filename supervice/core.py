@@ -105,3 +105,51 @@ class Supervisor:
 
     def _handle_sighup(self) -> None:
         self.logger.info("Received SIGHUP, ignoring (use 'reload' command instead)")
+
+    async def reload_config(self) -> dict[str, list[str]]:
+        self.logger.info("Reloading config from %s", self._config_path)
+        new_config = parse_config(self._config_path)
+
+        old_names = set(self.processes.keys())
+        new_names: set[str] = set()
+        new_programs: list[ProgramConfig] = []
+
+        for prog in new_config.programs:
+            if prog.numprocs > 1:
+                for i in range(prog.numprocs):
+                    new_names.add("%s:%02d" % (prog.name, i))
+            else:
+                new_names.add(prog.name)
+            new_programs.append(prog)
+
+        added = new_names - old_names
+        removed = old_names - new_names
+        changed = [n for n in (old_names & new_names) if self._program_changed(n, new_config)]
+
+        for name in removed:
+            proc = self.processes[name]
+            await proc.stop_process()
+            await proc.stop()
+            del self.processes[name]
+            for group_procs in self.groups.values():
+                if name in group_procs:
+                    group_procs.remove(name)
+
+        if added:
+            self._create_processes(new_programs)
+            for name in added:
+                if name in self.processes:
+                    await self.processes[name].start()
+
+        self.config = new_config
+
+        for name in changed:
+            self.logger.warning("Program '%s' config changed; restart manually to apply", name)
+
+        result: dict[str, list[str]] = {
+            "added": sorted(added),
+            "removed": sorted(removed),
+            "changed": sorted(changed),
+        }
+        self.logger.info("Reload complete: %s", result)
+        return result
