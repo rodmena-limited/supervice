@@ -4,17 +4,10 @@ import json
 import struct
 import sys
 from typing import Any
+
 HEADER_SIZE = 4
 MAX_MESSAGE_SIZE = 1024 * 1024
 
-def _format_uptime(seconds: int | None) -> str:
-    if seconds is None:
-        return "-"
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return "%d:%02d:%02d" % (hours, minutes, secs)
-    return "%d:%02d" % (minutes, secs)
 
 class Controller:
     def __init__(self, socket_path: str = "/tmp/supervice.sock"):
@@ -140,3 +133,118 @@ class Controller:
         except Exception as e:
             print("Error: %s" % e)
             return False
+
+    async def stop_group(self, name: str) -> bool:
+        try:
+            response = await self.send_command("stopgroup", name=name)
+            print(response.get("message"))
+            return response.get("status") == "ok"
+        except Exception as e:
+            print("Error: %s" % e)
+            return False
+
+    async def reload(self) -> bool:
+        try:
+            response = await self.send_command("reload")
+            if response.get("status") == "ok":
+                added = response.get("added", [])
+                removed = response.get("removed", [])
+                changed = response.get("changed", [])
+                if added:
+                    print("Added: %s" % ", ".join(added))
+                if removed:
+                    print("Removed: %s" % ", ".join(removed))
+                if changed:
+                    print("Changed (restart to apply): %s" % ", ".join(changed))
+                if not added and not removed and not changed:
+                    print("No changes detected")
+                return True
+            else:
+                print("Error:", response.get("message"))
+                return False
+        except FileNotFoundError:
+            print("Supervice is not running (socket not found)")
+            return False
+        except Exception as e:
+            print("Error: %s" % e)
+            return False
+
+
+def _format_uptime(seconds: int | None) -> str:
+    if seconds is None:
+        return "-"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="supervicectl",
+        description="Supervice process control client",
+    )
+    parser.add_argument(
+        "-s",
+        "--socket",
+        default="/tmp/supervice.sock",
+        help="Path to supervice Unix socket (default: /tmp/supervice.sock)",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("status", help="Show process status")
+
+    start_p = subparsers.add_parser("start", help="Start a process")
+    start_p.add_argument("name", help="Process name")
+
+    stop_p = subparsers.add_parser("stop", help="Stop a process")
+    stop_p.add_argument("name", help="Process name")
+
+    restart_p = subparsers.add_parser("restart", help="Restart a process")
+    restart_p.add_argument("name", help="Process name")
+    restart_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Force restart with SIGKILL instead of graceful stop",
+    )
+
+    startgroup_p = subparsers.add_parser("startgroup", help="Start a process group")
+    startgroup_p.add_argument("name", help="Group name")
+
+    stopgroup_p = subparsers.add_parser("stopgroup", help="Stop a process group")
+    stopgroup_p.add_argument("name", help="Group name")
+
+    subparsers.add_parser("reload", help="Reload configuration")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    client = Controller(socket_path=args.socket)
+
+    success = False
+    if args.command == "status":
+        success = asyncio.run(client.status())
+    elif args.command == "start":
+        success = asyncio.run(client.start_process(args.name))
+    elif args.command == "stop":
+        success = asyncio.run(client.stop_process(args.name))
+    elif args.command == "restart":
+        success = asyncio.run(client.restart_process(args.name, force=args.force))
+    elif args.command == "startgroup":
+        success = asyncio.run(client.start_group(args.name))
+    elif args.command == "stopgroup":
+        success = asyncio.run(client.stop_group(args.name))
+    elif args.command == "reload":
+        success = asyncio.run(client.reload())
+
+    if not success:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
