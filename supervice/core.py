@@ -181,3 +181,17 @@ class Supervisor:
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, str(os.getpid()).encode())
         self._pidfile_fd = fd
+
+    def _release_pidfile_lock(self) -> None:
+        if self._pidfile_fd is not None:
+            try:
+                fcntl.flock(self._pidfile_fd, fcntl.LOCK_UN)
+                os.close(self._pidfile_fd)
+            except OSError:
+                pass
+            self._pidfile_fd = None
+            if self.config.pidfile and os.path.exists(self.config.pidfile):
+                try:
+                    os.remove(self.config.pidfile)
+                except OSError:
+                    pass
