@@ -21,3 +21,23 @@ class Supervisor:
         self.rpc_server: RPCServer | None = None
         self._pidfile_fd: int | None = None
         self._config_path: str = ""
+
+    def load_config(self, path: str) -> None:
+        self.logger.info("Loading config from %s", path)
+        self._config_path = path
+        try:
+            self.config = parse_config(path)
+            # Re-setup logger with config values
+            setup_logger(
+                level=self.config.loglevel,
+                logfile=self.config.logfile,
+                maxbytes=self.config.log_maxbytes,
+                backups=self.config.log_backups,
+            )
+            # Initialize RPC server with configured socket path
+            self.rpc_server = RPCServer(self.config.socket_path, self)
+        except Exception as e:
+            self.logger.critical("Failed to load config: %s", e)
+            raise
+
+        self._create_processes(self.config.programs)
