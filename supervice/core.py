@@ -153,3 +153,17 @@ class Supervisor:
         }
         self.logger.info("Reload complete: %s", result)
         return result
+
+    def _program_changed(self, name: str, new_config: SupervisorConfig) -> bool:
+        old_proc = self.processes.get(name)
+        if not old_proc:
+            return False
+        for prog in new_config.programs:
+            if prog.numprocs > 1:
+                for i in range(prog.numprocs):
+                    if "%s:%02d" % (prog.name, i) == name:
+                        new_conf = replace(prog, name=name)
+                        return old_proc.config != new_conf
+            elif prog.name == name:
+                return old_proc.config != prog
+        return False
