@@ -102,3 +102,6 @@ class Supervisor:
     def _handle_signal(self, sig: int) -> None:
         self.logger.info("Received signal %d", sig)
         self._shutdown_event.set()
+
+    def _handle_sighup(self) -> None:
+        self.logger.info("Received SIGHUP, ignoring (use 'reload' command instead)")
