@@ -41,3 +41,66 @@ class Controller:
         header = struct.pack(">I", len(data))
         writer.write(header + data)
         await writer.drain()
+
+    async def send_command(self, command: str, **kwargs: Any) -> dict[str, Any]:
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+
+        try:
+            request = {"command": command, **kwargs}
+            await self._write_message(writer, json.dumps(request).encode("utf-8"))
+
+            data = await self._read_message(reader)
+
+            if data is None:
+                return {"status": "error", "message": "Empty response"}
+
+            return json.loads(data.decode("utf-8"))  # type: ignore
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def status(self) -> bool:
+        try:
+            response = await self.send_command("status")
+            if response.get("status") == "ok":
+                processes = response.get("processes", [])
+                has_health = any("healthy" in p for p in processes)
+                has_uptime = any("uptime" in p for p in processes)
+
+                header = f"{'NAME':<20} {'STATE':<10} {'PID':<10}"
+                sep_len = 40
+                if has_uptime:
+                    header += f" {'UPTIME':<12}"
+                    sep_len += 12
+                if has_health:
+                    header += f" {'HEALTH':<10}"
+                    sep_len += 10
+                print(header)
+                print("-" * sep_len)
+
+                for proc in processes:
+                    pid = proc.get("pid") or "-"
+                    line = f"{proc['name']:<20} {proc['state']:<10} {pid:<10}"
+                    if has_uptime:
+                        uptime = proc.get("uptime")
+                        line += f" {_format_uptime(uptime):<12}"
+                    if has_health:
+                        health = proc.get("healthy")
+                        if health is None:
+                            health_str = "-"
+                        elif health:
+                            health_str = "OK"
+                        else:
+                            health_str = "FAIL"
+                        line += f" {health_str:<10}"
+                    print(line)
+                return True
+            else:
+                print("Error:", response.get("message"))
+                return False
+        except FileNotFoundError:
+            print("Supervice is not running (socket not found)")
+            return False
+        except Exception as e:
+            print("Error connecting to supervice:", e)
+            return False
