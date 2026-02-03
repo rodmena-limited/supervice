@@ -104,3 +104,21 @@ class Controller:
         except Exception as e:
             print("Error connecting to supervice:", e)
             return False
+
+    async def start_process(self, name: str) -> bool:
+        try:
+            response = await self.send_command("start", name=name)
+            print(response.get("message"))
+            return response.get("status") == "ok"
+        except Exception as e:
+            print("Error: %s" % e)
+            return False
+
+    async def stop_process(self, name: str) -> bool:
+        try:
+            response = await self.send_command("stop", name=name)
+            print(response.get("message"))
+            return response.get("status") == "ok"
+        except Exception as e:
+            print("Error: %s" % e)
+            return False
