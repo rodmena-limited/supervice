@@ -122,3 +122,21 @@ class Controller:
         except Exception as e:
             print("Error: %s" % e)
             return False
+
+    async def restart_process(self, name: str, force: bool = False) -> bool:
+        try:
+            response = await self.send_command("restart", name=name, force=force)
+            print(response.get("message"))
+            return response.get("status") == "ok"
+        except Exception as e:
+            print("Error: %s" % e)
+            return False
+
+    async def start_group(self, name: str) -> bool:
+        try:
+            response = await self.send_command("startgroup", name=name)
+            print(response.get("message"))
+            return response.get("status") == "ok"
+        except Exception as e:
+            print("Error: %s" % e)
+            return False
