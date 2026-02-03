@@ -46,3 +46,29 @@ class Supervisor:
         if path is None:
             return None
         return path.replace("%(process_num)s", "%02d" % process_num)
+
+    def _create_processes(
+        self,
+        programs: list[ProgramConfig],
+    ) -> None:
+        for prog_config in programs:
+            group_name = prog_config.group if prog_config.group else prog_config.name
+            if group_name not in self.groups:
+                self.groups[group_name] = []
+
+            if prog_config.numprocs > 1:
+                for i in range(prog_config.numprocs):
+                    instance_name = "%s:%02d" % (prog_config.name, i)
+                    p_conf = replace(
+                        prog_config,
+                        name=instance_name,
+                        stdout_logfile=self._expand_logfile(prog_config.stdout_logfile, i),
+                        stderr_logfile=self._expand_logfile(prog_config.stderr_logfile, i),
+                    )
+                    if instance_name not in self.processes:
+                        self.processes[instance_name] = Process(p_conf, self.event_bus)
+                        self.groups[group_name].append(instance_name)
+            else:
+                if prog_config.name not in self.processes:
+                    self.processes[prog_config.name] = Process(prog_config, self.event_bus)
+                    self.groups[group_name].append(prog_config.name)
