@@ -72,3 +72,29 @@ class Supervisor:
                 if prog_config.name not in self.processes:
                     self.processes[prog_config.name] = Process(prog_config, self.event_bus)
                     self.groups[group_name].append(prog_config.name)
+
+    async def run(self) -> None:
+        self.logger.info("Supervisor starting")
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self._handle_signal, sig)
+        loop.add_signal_handler(signal.SIGHUP, self._handle_sighup)
+
+        if self.config.pidfile:
+            self._acquire_pidfile_lock()
+
+        self.event_bus.start()
+        start_tasks = []
+        for process in self.processes.values():
+            start_tasks.append(process.start())
+
+        if start_tasks:
+            await asyncio.gather(*start_tasks)
+
+        if self.rpc_server:
+            await self.rpc_server.start()
+
+        await self._shutdown_event.wait()
+
+        await self.shutdown()
