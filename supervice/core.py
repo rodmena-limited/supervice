@@ -98,3 +98,7 @@ class Supervisor:
         await self._shutdown_event.wait()
 
         await self.shutdown()
+
+    def _handle_signal(self, sig: int) -> None:
+        self.logger.info("Received signal %d", sig)
+        self._shutdown_event.set()
