@@ -42,5 +42,8 @@ VALID_SIGNALS = frozenset(
     }
 )
 
+def _parse_bool(value: str) -> bool:
+    return value.lower() in ("true", "1", "yes", "on")
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
