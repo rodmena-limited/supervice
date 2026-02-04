@@ -37,3 +37,11 @@ class EventBus:
     def start(self) -> None:
         if not self._task:
             self._task = asyncio.create_task(self._process_events())
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
