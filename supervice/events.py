@@ -3,9 +3,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
+
 from supervice.logger import get_logger
+
+# Maximum events that can be queued before backpressure
 MAX_EVENT_QUEUE_SIZE = 1000
-EventHandler = Callable[[Event], Awaitable[None]]
+
 
 class EventType(Enum):
     PROCESS_STATE_STARTING = auto()
@@ -16,14 +19,19 @@ class EventType(Enum):
     PROCESS_STATE_STOPPED = auto()
     PROCESS_STATE_FATAL = auto()
     PROCESS_STATE_UNKNOWN = auto()
-    PROCESS_STATE_UNHEALTHY = auto()
+    PROCESS_STATE_UNHEALTHY = auto()  # For health check failures
     HEALTHCHECK_PASSED = auto()
     HEALTHCHECK_FAILED = auto()
+
 
 @dataclass
 class Event:
     type: EventType
     payload: dict[str, Any]
+
+
+EventHandler = Callable[[Event], Awaitable[None]]
+
 
 class EventBus:
     def __init__(self, maxsize: int = MAX_EVENT_QUEUE_SIZE) -> None:
@@ -71,3 +79,14 @@ class EventBus:
                 self._queue.put_nowait(event)
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass  # Race condition, just drop the event
+
+    async def _process_events(self) -> None:
+        while True:
+            event = await self._queue.get()
+            handlers = self.subscribers.get(event.type, [])
+            for handler in handlers:
+                try:
+                    await handler(event)
+                except Exception as e:
+                    self.logger.error("Error handling event %s: %s", event.type, e)
+            self._queue.task_done()
