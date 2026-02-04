@@ -9,3 +9,7 @@ class HealthCheckResult:
     def __init__(self, healthy: bool, message: str = ""):
         self.healthy = healthy
         self.message = message
+
+    def __repr__(self) -> str:
+        status = "healthy" if self.healthy else "unhealthy"
+        return "HealthCheckResult(%s: %s)" % (status, self.message)
