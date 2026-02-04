@@ -41,3 +41,6 @@ VALID_SIGNALS = frozenset(
         "SYS",
     }
 )
+
+class ConfigValidationError(ValueError):
+    """Raised when config validation fails."""
