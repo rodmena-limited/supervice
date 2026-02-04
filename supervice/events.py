@@ -33,3 +33,7 @@ class EventBus:
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=maxsize)
         self._task: asyncio.Task[None] | None = None
         self._dropped_events = 0
+
+    def start(self) -> None:
+        if not self._task:
+            self._task = asyncio.create_task(self._process_events())
