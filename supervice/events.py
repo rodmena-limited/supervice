@@ -45,3 +45,8 @@ class EventBus:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+    def subscribe(self, event_type: EventType, handler: EventHandler) -> None:
+        if event_type not in self.subscribers:
+            self.subscribers[event_type] = []
+        self.subscribers[event_type].append(handler)
