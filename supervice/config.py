@@ -176,5 +176,37 @@ def _validate_healthcheck(hc: HealthCheckConfig, program_name: str) -> None:
                 "Program '%s': healthcheck_command required for script checks" % program_name
             )
 
+def _validate_program(prog: ProgramConfig) -> None:
+    """Validate a program configuration."""
+    # Validate numeric bounds
+    _validate_positive_int(prog.numprocs, "numprocs", prog.name)
+    _validate_positive_int(prog.startsecs, "startsecs", prog.name)
+    _validate_positive_int(prog.startretries, "startretries", prog.name)
+    _validate_positive_int(prog.stopwaitsecs, "stopwaitsecs", prog.name)
+
+    if prog.numprocs == 0:
+        raise ConfigValidationError("Program '%s': numprocs must be at least 1" % prog.name)
+
+    # Validate signal
+    _validate_signal(prog.stopsignal, prog.name)
+
+    # Validate user if specified
+    if prog.user:
+        _validate_user(prog.user, prog.name)
+
+    # Validate directory if specified
+    if prog.directory:
+        _validate_directory(prog.directory, prog.name)
+
+    # Validate log file paths if specified
+    if prog.stdout_logfile:
+        _validate_logfile_path(prog.stdout_logfile, prog.name)
+    if prog.stderr_logfile:
+        _validate_logfile_path(prog.stderr_logfile, prog.name)
+
+    # Validate health check if configured
+    if prog.healthcheck.type != HealthCheckType.NONE:
+        _validate_healthcheck(prog.healthcheck, prog.name)
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
