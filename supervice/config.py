@@ -1,11 +1,14 @@
 import configparser
 import os
+
 from supervice.models import (
     HealthCheckConfig,
     HealthCheckType,
     ProgramConfig,
     SupervisorConfig,
 )
+
+# Valid signal names (without SIG prefix)
 VALID_SIGNALS = frozenset(
     {
         "HUP",
@@ -42,8 +45,16 @@ VALID_SIGNALS = frozenset(
     }
 )
 
+
+class ConfigValidationError(ValueError):
+    """Raised when config validation fails."""
+
+    pass
+
+
 def _parse_bool(value: str) -> bool:
     return value.lower() in ("true", "1", "yes", "on")
+
 
 def _parse_env(value: str) -> dict[str, str]:
     env: dict[str, str] = {}
@@ -91,6 +102,7 @@ def _parse_env(value: str) -> dict[str, str]:
 
     return env
 
+
 def _validate_signal(sig_name: str, program_name: str) -> None:
     """Validate that a signal name is valid."""
     sig_upper = sig_name.upper()
@@ -104,6 +116,7 @@ def _validate_signal(sig_name: str, program_name: str) -> None:
                 % (program_name, sig_name, ", ".join(sorted(VALID_SIGNALS)))
             )
 
+
 def _validate_user(username: str, program_name: str) -> None:
     """Validate that a user exists on the system."""
     import pwd
@@ -114,6 +127,7 @@ def _validate_user(username: str, program_name: str) -> None:
         raise ConfigValidationError(
             "Program '%s': user '%s' does not exist" % (program_name, username)
         ) from e
+
 
 def _validate_directory(directory: str, program_name: str) -> None:
     """Validate that a directory exists and is accessible."""
@@ -130,6 +144,7 @@ def _validate_directory(directory: str, program_name: str) -> None:
             "Program '%s': directory '%s' is not accessible" % (program_name, directory)
         )
 
+
 def _validate_logfile_path(logfile: str, program_name: str) -> None:
     """Validate that the parent directory of a logfile exists and is writable."""
     parent_dir = os.path.dirname(logfile) or "."
@@ -142,12 +157,14 @@ def _validate_logfile_path(logfile: str, program_name: str) -> None:
             "Program '%s': log directory '%s' is not writable" % (program_name, parent_dir)
         )
 
+
 def _validate_positive_int(value: int, field_name: str, program_name: str) -> None:
     """Validate that a value is a positive integer."""
     if value < 0:
         raise ConfigValidationError(
             "Program '%s': %s must be non-negative, got %d" % (program_name, field_name, value)
         )
+
 
 def _validate_healthcheck(hc: HealthCheckConfig, program_name: str) -> None:
     """Validate health check configuration."""
@@ -175,6 +192,7 @@ def _validate_healthcheck(hc: HealthCheckConfig, program_name: str) -> None:
             raise ConfigValidationError(
                 "Program '%s': healthcheck_command required for script checks" % program_name
             )
+
 
 def _validate_program(prog: ProgramConfig) -> None:
     """Validate a program configuration."""
@@ -208,5 +226,108 @@ def _validate_program(prog: ProgramConfig) -> None:
     if prog.healthcheck.type != HealthCheckType.NONE:
         _validate_healthcheck(prog.healthcheck, prog.name)
 
-class ConfigValidationError(ValueError):
-    """Raised when config validation fails."""
+
+def parse_config(path: str) -> SupervisorConfig:
+    if not os.path.exists(path):
+        raise FileNotFoundError("Config file not found: %s" % path)
+
+    parser = configparser.ConfigParser()
+    parser.read(path)
+
+    sup_config = SupervisorConfig()
+
+    if parser.has_section("supervice"):
+        sect = parser["supervice"]
+        sup_config.logfile = sect.get("logfile", sup_config.logfile)
+        sup_config.pidfile = sect.get("pidfile", sup_config.pidfile)
+        sup_config.loglevel = sect.get("loglevel", sup_config.loglevel)
+        sup_config.socket_path = sect.get("socket", sup_config.socket_path)
+        sup_config.shutdown_timeout = sect.getint("shutdown_timeout", sup_config.shutdown_timeout)
+        sup_config.log_maxbytes = sect.getint("log_maxbytes", sup_config.log_maxbytes)
+        sup_config.log_backups = sect.getint("log_backups", sup_config.log_backups)
+
+        # Validate loglevel
+        valid_levels = {"DEBUG", "INFO", "WARNING", "WARN", "ERROR", "CRITICAL"}
+        if sup_config.loglevel.upper() not in valid_levels:
+            raise ConfigValidationError(
+                "Invalid loglevel '%s'. Valid levels: %s"
+                % (sup_config.loglevel, ", ".join(sorted(valid_levels)))
+            )
+
+        # Validate numeric bounds
+        if sup_config.shutdown_timeout <= 0:
+            raise ConfigValidationError("shutdown_timeout must be positive")
+        if sup_config.log_maxbytes < 0:
+            raise ConfigValidationError("log_maxbytes must be non-negative")
+        if sup_config.log_backups < 0:
+            raise ConfigValidationError("log_backups must be non-negative")
+
+    for section in parser.sections():
+        if section.startswith("program:"):
+            name = section.split(":", 1)[1]
+            sect = parser[section]
+
+            # Parse health check configuration
+            hc_type_str = sect.get("healthcheck_type", "none").lower()
+            hc_type = HealthCheckType.NONE
+            if hc_type_str == "tcp":
+                hc_type = HealthCheckType.TCP
+            elif hc_type_str == "script":
+                hc_type = HealthCheckType.SCRIPT
+
+            healthcheck = HealthCheckConfig(
+                type=hc_type,
+                interval=sect.getint("healthcheck_interval", 30),
+                timeout=sect.getint("healthcheck_timeout", 10),
+                retries=sect.getint("healthcheck_retries", 3),
+                start_period=sect.getint("healthcheck_start_period", 10),
+                port=sect.getint("healthcheck_port") if sect.get("healthcheck_port") else None,
+                host=sect.get("healthcheck_host", "127.0.0.1"),
+                command=sect.get("healthcheck_command"),
+            )
+
+            prog = ProgramConfig(
+                name=name,
+                command=sect.get("command", ""),
+                numprocs=sect.getint("numprocs", 1),
+                autostart=_parse_bool(sect.get("autostart", "true")),
+                autorestart=_parse_bool(sect.get("autorestart", "true")),
+                startsecs=sect.getint("startsecs", 1),
+                startretries=sect.getint("startretries", 3),
+                stopsignal=sect.get("stopsignal", "TERM"),
+                stopwaitsecs=sect.getint("stopwaitsecs", 10),
+                stdout_logfile=sect.get("stdout_logfile"),
+                stderr_logfile=sect.get("stderr_logfile"),
+                environment=_parse_env(sect.get("environment", "")),
+                directory=sect.get("directory"),
+                user=sect.get("user"),
+                healthcheck=healthcheck,
+            )
+
+            if not prog.command:
+                raise ConfigValidationError("Program '%s': missing command" % name)
+
+            # Validate the program configuration
+            _validate_program(prog)
+
+            sup_config.programs.append(prog)
+
+    # Process groups
+    # Groups are defined as [group:foo]
+    # programs=bar,baz
+    for section in parser.sections():
+        if section.startswith("group:"):
+            group_name = section.split(":", 1)[1]
+            sect = parser[section]
+            programs_str = sect.get("programs", "")
+            if not programs_str:
+                continue
+
+            program_names = [p.strip() for p in programs_str.split(",")]
+
+            # Verify and update programs
+            for prog in sup_config.programs:
+                if prog.name in program_names:
+                    prog.group = group_name
+
+    return sup_config
