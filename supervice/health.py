@@ -1,11 +1,16 @@
+"""Health check implementations for process monitoring."""
+
 import asyncio
 import socket
 from abc import ABC, abstractmethod
+
 from supervice.logger import get_logger
 from supervice.models import HealthCheckConfig, HealthCheckType
 
+
 class HealthCheckResult:
     """Result of a health check execution."""
+
     def __init__(self, healthy: bool, message: str = ""):
         self.healthy = healthy
         self.message = message
@@ -14,15 +19,19 @@ class HealthCheckResult:
         status = "healthy" if self.healthy else "unhealthy"
         return "HealthCheckResult(%s: %s)" % (status, self.message)
 
+
 class HealthChecker(ABC):
     """Abstract base class for health checkers."""
+
     def __init__(self, config: HealthCheckConfig):
         self.config = config
         self.logger = get_logger()
 
+    @abstractmethod
     async def check(self) -> HealthCheckResult:
         """Execute the health check and return the result."""
         pass
+
 
 class TCPHealthChecker(HealthChecker):
     """Health checker that verifies TCP connectivity to a port."""
@@ -60,6 +69,7 @@ class TCPHealthChecker(HealthChecker):
                 )
         except Exception as e:
             return HealthCheckResult(False, "TCP health check error: %s" % e)
+
 
 class ScriptHealthChecker(HealthChecker):
     """Health checker that runs a script and checks exit code."""
@@ -101,3 +111,12 @@ class ScriptHealthChecker(HealthChecker):
                 )
         except Exception as e:
             return HealthCheckResult(False, "Health check script error: %s" % e)
+
+
+def create_health_checker(config: HealthCheckConfig) -> HealthChecker | None:
+    """Factory function to create the appropriate health checker."""
+    if config.type == HealthCheckType.TCP:
+        return TCPHealthChecker(config)
+    elif config.type == HealthCheckType.SCRIPT:
+        return ScriptHealthChecker(config)
+    return None
