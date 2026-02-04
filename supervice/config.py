@@ -130,5 +130,17 @@ def _validate_directory(directory: str, program_name: str) -> None:
             "Program '%s': directory '%s' is not accessible" % (program_name, directory)
         )
 
+def _validate_logfile_path(logfile: str, program_name: str) -> None:
+    """Validate that the parent directory of a logfile exists and is writable."""
+    parent_dir = os.path.dirname(logfile) or "."
+    if not os.path.exists(parent_dir):
+        raise ConfigValidationError(
+            "Program '%s': log directory '%s' does not exist" % (program_name, parent_dir)
+        )
+    if not os.access(parent_dir, os.W_OK):
+        raise ConfigValidationError(
+            "Program '%s': log directory '%s' is not writable" % (program_name, parent_dir)
+        )
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
