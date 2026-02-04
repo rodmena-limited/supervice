@@ -142,5 +142,12 @@ def _validate_logfile_path(logfile: str, program_name: str) -> None:
             "Program '%s': log directory '%s' is not writable" % (program_name, parent_dir)
         )
 
+def _validate_positive_int(value: int, field_name: str, program_name: str) -> None:
+    """Validate that a value is a positive integer."""
+    if value < 0:
+        raise ConfigValidationError(
+            "Program '%s': %s must be non-negative, got %d" % (program_name, field_name, value)
+        )
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
