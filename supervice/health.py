@@ -60,3 +60,6 @@ class TCPHealthChecker(HealthChecker):
                 )
         except Exception as e:
             return HealthCheckResult(False, "TCP health check error: %s" % e)
+
+class ScriptHealthChecker(HealthChecker):
+    """Health checker that runs a script and checks exit code."""
