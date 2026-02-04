@@ -63,3 +63,41 @@ class TCPHealthChecker(HealthChecker):
 
 class ScriptHealthChecker(HealthChecker):
     """Health checker that runs a script and checks exit code."""
+
+    async def check(self) -> HealthCheckResult:
+        if not self.config.command:
+            return HealthCheckResult(False, "No command configured for script health check")
+
+        timeout = self.config.timeout
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                self.config.command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+                if proc.returncode == 0:
+                    return HealthCheckResult(True, "Health check script exited with code 0")
+                else:
+                    stderr_msg = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+                    return_code = proc.returncode if proc.returncode is not None else -1
+                    return HealthCheckResult(
+                        False,
+                        "Health check script exited with code %d%s"
+                        % (return_code, ": " + stderr_msg if stderr_msg else ""),
+                    )
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                return HealthCheckResult(
+                    False, "Health check script timed out after %ds" % timeout
+                )
+        except Exception as e:
+            return HealthCheckResult(False, "Health check script error: %s" % e)
