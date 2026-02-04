@@ -19,3 +19,8 @@ class EventType(Enum):
     PROCESS_STATE_UNHEALTHY = auto()
     HEALTHCHECK_PASSED = auto()
     HEALTHCHECK_FAILED = auto()
+
+@dataclass
+class Event:
+    type: EventType
+    payload: dict[str, Any]
