@@ -104,5 +104,16 @@ def _validate_signal(sig_name: str, program_name: str) -> None:
                 % (program_name, sig_name, ", ".join(sorted(VALID_SIGNALS)))
             )
 
+def _validate_user(username: str, program_name: str) -> None:
+    """Validate that a user exists on the system."""
+    import pwd
+
+    try:
+        pwd.getpwnam(username)
+    except KeyError as e:
+        raise ConfigValidationError(
+            "Program '%s': user '%s' does not exist" % (program_name, username)
+        ) from e
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
