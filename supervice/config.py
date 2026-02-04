@@ -91,5 +91,18 @@ def _parse_env(value: str) -> dict[str, str]:
 
     return env
 
+def _validate_signal(sig_name: str, program_name: str) -> None:
+    """Validate that a signal name is valid."""
+    sig_upper = sig_name.upper()
+    if sig_upper not in VALID_SIGNALS:
+        # Also check with SIG prefix stripped
+        if sig_upper.startswith("SIG"):
+            sig_upper = sig_upper[3:]
+        if sig_upper not in VALID_SIGNALS:
+            raise ConfigValidationError(
+                "Program '%s': invalid stopsignal '%s'. Valid signals: %s"
+                % (program_name, sig_name, ", ".join(sorted(VALID_SIGNALS)))
+            )
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
