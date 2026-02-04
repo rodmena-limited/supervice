@@ -23,3 +23,6 @@ class HealthChecker(ABC):
     async def check(self) -> HealthCheckResult:
         """Execute the health check and return the result."""
         pass
+
+class TCPHealthChecker(HealthChecker):
+    """Health checker that verifies TCP connectivity to a port."""
