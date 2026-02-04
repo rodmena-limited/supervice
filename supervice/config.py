@@ -149,5 +149,32 @@ def _validate_positive_int(value: int, field_name: str, program_name: str) -> No
             "Program '%s': %s must be non-negative, got %d" % (program_name, field_name, value)
         )
 
+def _validate_healthcheck(hc: HealthCheckConfig, program_name: str) -> None:
+    """Validate health check configuration."""
+    _validate_positive_int(hc.interval, "healthcheck_interval", program_name)
+    _validate_positive_int(hc.timeout, "healthcheck_timeout", program_name)
+    _validate_positive_int(hc.retries, "healthcheck_retries", program_name)
+    _validate_positive_int(hc.start_period, "healthcheck_start_period", program_name)
+
+    if hc.interval == 0:
+        raise ConfigValidationError(
+            "Program '%s': healthcheck_interval must be at least 1" % program_name
+        )
+
+    if hc.type == HealthCheckType.TCP:
+        if hc.port is None:
+            raise ConfigValidationError(
+                "Program '%s': healthcheck_port is required for TCP health checks" % program_name
+            )
+        if hc.port < 1 or hc.port > 65535:
+            raise ConfigValidationError(
+                "Program '%s': healthcheck_port must be between 1 and 65535" % program_name
+            )
+    elif hc.type == HealthCheckType.SCRIPT:
+        if not hc.command:
+            raise ConfigValidationError(
+                "Program '%s': healthcheck_command required for script checks" % program_name
+            )
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
