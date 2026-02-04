@@ -17,3 +17,22 @@ class HealthCheckConfig:
     port: int | None = None
     host: str = '127.0.0.1'
     command: str | None = None
+
+@dataclass
+class ProgramConfig:
+    name: str
+    command: str
+    numprocs: int = 1
+    autostart: bool = True
+    autorestart: bool = True
+    startsecs: int = 1
+    startretries: int = 3
+    stopsignal: str = 'TERM'
+    stopwaitsecs: int = 10
+    stdout_logfile: str | None = None
+    stderr_logfile: str | None = None
+    environment: dict[str, str] = field(default_factory=dict)
+    directory: str | None = None
+    user: str | None = None
+    group: str | None = None
+    healthcheck: HealthCheckConfig = field(default_factory=HealthCheckConfig)
