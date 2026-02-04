@@ -50,3 +50,24 @@ class EventBus:
         if event_type not in self.subscribers:
             self.subscribers[event_type] = []
         self.subscribers[event_type].append(handler)
+
+    def publish(self, event: Event) -> None:
+        """Publish an event. If queue is full, log warning and drop oldest event."""
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Queue is full - apply backpressure by dropping oldest event
+            self._dropped_events += 1
+            if self._dropped_events == 1 or self._dropped_events % 100 == 0:
+                self.logger.warning(
+                    "Event queue full, dropped %d events (latest: %s)",
+                    self._dropped_events,
+                    event.type.name,
+                )
+            try:
+                # Remove oldest event to make room
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self._queue.put_nowait(event)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass  # Race condition, just drop the event
