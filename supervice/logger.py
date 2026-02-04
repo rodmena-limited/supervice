@@ -1,8 +1,11 @@
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+
+# Default log rotation settings
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50MB
 DEFAULT_BACKUP_COUNT = 10
+
 
 def setup_logger(
     level: str = "INFO",
@@ -53,3 +56,8 @@ def setup_logger(
         logger.addHandler(stream_handler)
 
     return logger
+
+
+def get_logger() -> logging.Logger:
+    """Returns the global logger instance."""
+    return logging.getLogger("supervice")
