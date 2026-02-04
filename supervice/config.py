@@ -115,5 +115,20 @@ def _validate_user(username: str, program_name: str) -> None:
             "Program '%s': user '%s' does not exist" % (program_name, username)
         ) from e
 
+def _validate_directory(directory: str, program_name: str) -> None:
+    """Validate that a directory exists and is accessible."""
+    if not os.path.exists(directory):
+        raise ConfigValidationError(
+            "Program '%s': directory '%s' does not exist" % (program_name, directory)
+        )
+    if not os.path.isdir(directory):
+        raise ConfigValidationError(
+            "Program '%s': '%s' is not a directory" % (program_name, directory)
+        )
+    if not os.access(directory, os.X_OK):
+        raise ConfigValidationError(
+            "Program '%s': directory '%s' is not accessible" % (program_name, directory)
+        )
+
 class ConfigValidationError(ValueError):
     """Raised when config validation fails."""
