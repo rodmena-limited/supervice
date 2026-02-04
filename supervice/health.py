@@ -19,3 +19,7 @@ class HealthChecker(ABC):
     def __init__(self, config: HealthCheckConfig):
         self.config = config
         self.logger = get_logger()
+
+    async def check(self) -> HealthCheckResult:
+        """Execute the health check and return the result."""
+        pass
