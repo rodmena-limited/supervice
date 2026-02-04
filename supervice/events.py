@@ -24,3 +24,12 @@ class EventType(Enum):
 class Event:
     type: EventType
     payload: dict[str, Any]
+
+class EventBus:
+    def __init__(self, maxsize: int = MAX_EVENT_QUEUE_SIZE) -> None:
+        self.subscribers: dict[EventType, list[EventHandler]] = {}
+        self.logger = get_logger()
+        # Bounded queue to prevent memory exhaustion
+        self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=maxsize)
+        self._task: asyncio.Task[None] | None = None
+        self._dropped_events = 0
