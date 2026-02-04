@@ -13,3 +13,9 @@ class HealthCheckResult:
     def __repr__(self) -> str:
         status = "healthy" if self.healthy else "unhealthy"
         return "HealthCheckResult(%s: %s)" % (status, self.message)
+
+class HealthChecker(ABC):
+    """Abstract base class for health checkers."""
+    def __init__(self, config: HealthCheckConfig):
+        self.config = config
+        self.logger = get_logger()
