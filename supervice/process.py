@@ -13,3 +13,6 @@ from supervice.models import HealthCheckType, ProgramConfig
 STOPPED = "STOPPED"
 STARTING = "STARTING"
 RUNNING = "RUNNING"
+BACKOFF = "BACKOFF"
+STOPPING = "STOPPING"
+EXITED = "EXITED"
