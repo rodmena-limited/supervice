@@ -77,3 +77,7 @@ class TestConfigParsing(unittest.TestCase):
 
         finally:
             os.remove(fname)
+
+    def test_parse_config_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            parse_config("nonexistent_file.conf")
