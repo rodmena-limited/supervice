@@ -42,3 +42,38 @@ class TestConfigParsing(unittest.TestCase):
         self.assertEqual(env["KEY3"], "val3")
 
         self.assertEqual(_parse_env(""), {})
+
+    def test_parse_config_file(self):
+        config_content = """
+    [supervice]
+    loglevel=DEBUG
+    logfile=test.log
+
+    [program:prog1]
+    command=sleep 1
+    numprocs=2
+    environment=FOO=bar
+
+    [group:g1]
+    programs=prog1
+    """
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            config = parse_config(fname)
+
+            self.assertEqual(config.loglevel, "DEBUG")
+            self.assertEqual(config.logfile, "test.log")
+            self.assertEqual(len(config.programs), 1)
+
+            prog = config.programs[0]
+            self.assertEqual(prog.name, "prog1")
+            self.assertEqual(prog.command, "sleep 1")
+            self.assertEqual(prog.numprocs, 2)
+            self.assertEqual(prog.environment["FOO"], "bar")
+            self.assertEqual(prog.group, "g1")
+
+        finally:
+            os.remove(fname)
