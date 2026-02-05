@@ -21,4 +21,15 @@ class TestModels(unittest.TestCase):
         self.assertEqual(sc.programs, [])
 
 class TestConfigParsing(unittest.TestCase):
-    pass
+
+    def test_parse_bool(self):
+        self.assertTrue(_parse_bool("true"))
+        self.assertTrue(_parse_bool("True"))
+        self.assertTrue(_parse_bool("1"))
+        self.assertTrue(_parse_bool("yes"))
+        self.assertTrue(_parse_bool("on"))
+        self.assertFalse(_parse_bool("false"))
+        self.assertFalse(_parse_bool("0"))
+        self.assertFalse(_parse_bool("no"))
+        self.assertFalse(_parse_bool("off"))
+        self.assertFalse(_parse_bool("random"))
