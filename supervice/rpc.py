@@ -64,3 +64,9 @@ class RPCServer:
 
         # Read the message body
         return await reader.readexactly(msg_length)
+
+    async def _write_message(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+        """Write a length-prefixed message to the stream."""
+        header = struct.pack(">I", len(data))
+        writer.write(header + data)
+        await writer.drain()
