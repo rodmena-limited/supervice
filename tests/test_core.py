@@ -48,3 +48,20 @@ class TestRPCServer(unittest.TestCase):
             self.assertFalse(os.path.exists(socket_path))
 
         asyncio.run(run())
+
+    def test_process_request_status(self):
+        async def run():
+            supervisor_mock = MagicMock()
+            proc_mock = MagicMock()
+            proc_mock.state = "RUNNING"
+            proc_mock.process.pid = 999
+            supervisor_mock.processes = {"p1": proc_mock}
+
+            server = RPCServer("sock", supervisor_mock)
+
+            request = {"command": "status"}
+            response = await server.process_request(request)
+
+            self.assertEqual(response["status"], "ok")
+
+        asyncio.run(run())
