@@ -1,11 +1,12 @@
 import os
 import tempfile
 import unittest
+
 from supervice.config import _parse_bool, _parse_env, parse_config
 from supervice.models import ProgramConfig, SupervisorConfig
 
-class TestModels(unittest.TestCase):
 
+class TestModels(unittest.TestCase):
     def test_program_config_defaults(self):
         pc = ProgramConfig(name="test", command="echo")
         self.assertEqual(pc.name, "test")
@@ -20,8 +21,8 @@ class TestModels(unittest.TestCase):
         self.assertEqual(sc.loglevel, "INFO")
         self.assertEqual(sc.programs, [])
 
-class TestConfigParsing(unittest.TestCase):
 
+class TestConfigParsing(unittest.TestCase):
     def test_parse_bool(self):
         self.assertTrue(_parse_bool("true"))
         self.assertTrue(_parse_bool("True"))
@@ -45,18 +46,18 @@ class TestConfigParsing(unittest.TestCase):
 
     def test_parse_config_file(self):
         config_content = """
-    [supervice]
-    loglevel=DEBUG
-    logfile=test.log
+[supervice]
+loglevel=DEBUG
+logfile=test.log
 
-    [program:prog1]
-    command=sleep 1
-    numprocs=2
-    environment=FOO=bar
+[program:prog1]
+command=sleep 1
+numprocs=2
+environment=FOO=bar
 
-    [group:g1]
-    programs=prog1
-    """
+[group:g1]
+programs=prog1
+"""
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
             f.write(config_content)
             fname = f.name
@@ -81,3 +82,22 @@ class TestConfigParsing(unittest.TestCase):
     def test_parse_config_missing_file(self):
         with self.assertRaises(FileNotFoundError):
             parse_config("nonexistent_file.conf")
+
+    def test_parse_config_missing_command(self):
+        config_content = """
+[program:bad]
+# no command
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            with self.assertRaises(ValueError):
+                parse_config(fname)
+        finally:
+            os.remove(fname)
+
+
+if __name__ == "__main__":
+    unittest.main()
