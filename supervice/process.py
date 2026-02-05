@@ -126,3 +126,154 @@ class Process:
                 await asyncio.wait_for(self._state_changed.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 break
+
+    async def stop_process(self) -> None:
+        """Request to stop the managed process (RPC)."""
+        async with self._state_lock:
+            self.should_run = False
+        await self.kill()
+
+    async def supervise(self) -> None:
+        """Main supervision loop."""
+        while not self.stop_event.is_set():
+            if self.should_run:
+                if self.state in (STOPPED, EXITED, FATAL, BACKOFF):
+                    if self.state == BACKOFF:
+                        delay = self.config.startsecs + self.backoff
+                        self.logger.info("Backoff %s: waiting %ds", self.config.name, delay)
+                        try:
+                            await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+                            continue
+                        except asyncio.TimeoutError:
+                            pass
+
+                    if self.should_run and not self.stop_event.is_set():
+                        await self.spawn()
+
+                        if self.state == EXITED:
+                            if self.config.autorestart:
+                                await self._change_state(BACKOFF)
+                                self.backoff += 1
+                                if self.backoff > self.config.startretries:
+                                    await self._change_state(FATAL)
+                                    self.should_run = False
+                            else:
+                                self.should_run = False
+                        elif self.state == FATAL:
+                            self.should_run = False
+
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+
+        if self.process and self.process.returncode is None:
+            await self.kill()
+
+    async def spawn(self) -> None:
+        await self._change_state(STARTING)
+        self.logger.info("Spawning %s", self.config.name)
+
+        stdout_dest: int | IO[Any] = asyncio.subprocess.DEVNULL
+        stderr_dest: int | IO[Any] = asyncio.subprocess.DEVNULL
+        stdout_file: IO[Any] | None = None
+        stderr_file: IO[Any] | None = None
+
+        try:
+            # Simple file logging
+            if self.config.stdout_logfile:
+                stdout_file = open(self.config.stdout_logfile, "a")
+                stdout_dest = stdout_file
+
+            if self.config.stderr_logfile:
+                stderr_file = open(self.config.stderr_logfile, "a")
+                stderr_dest = stderr_file
+
+            # Parse command
+            args = shlex.split(self.config.command)
+            program = args[0]
+            program_args = args[1:]
+
+            if not os.path.isabs(program):
+                import shutil
+
+                executable = shutil.which(program)
+                if not executable:
+                    raise FileNotFoundError("Command not found: %s" % program)
+            else:
+                executable = program
+
+            # Store user for preexec closure (avoid late binding issues)
+            target_user = self.config.user
+
+            def preexec() -> None:
+                # User switching - must happen first before any other setup
+                if target_user:
+                    import pwd
+
+                    try:
+                        pw_record = pwd.getpwnam(target_user)
+                        # Set supplementary groups first (requires root)
+                        try:
+                            os.initgroups(target_user, pw_record.pw_gid)
+                        except PermissionError:
+                            # Not running as root, just set primary group
+                            pass
+                        os.setgid(pw_record.pw_gid)
+                        os.setuid(pw_record.pw_uid)
+                    except KeyError:
+                        # User not found - write to stderr before exit
+                        sys.stderr.write("supervice: user '%s' not found\n" % target_user)
+                        sys.stderr.flush()
+                        os._exit(EXIT_CODE_USER_SWITCH_FAILED)
+                    except PermissionError:
+                        msg = "supervice: permission denied switching to user '%s'\n"
+                        sys.stderr.write(msg % target_user)
+                        sys.stderr.flush()
+                        os._exit(EXIT_CODE_USER_SWITCH_FAILED)
+                    except OSError as e:
+                        msg = "supervice: failed to switch to user '%s': %s\n"
+                        sys.stderr.write(msg % (target_user, e))
+                        sys.stderr.flush()
+                        os._exit(EXIT_CODE_USER_SWITCH_FAILED)
+
+                # Linux: auto-kill child when parent dies
+                if sys.platform == "linux":
+                    try:
+                        pr_set_pdeathsig = 1
+                        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                        libc.prctl(pr_set_pdeathsig, signal.SIGKILL)
+                    except (OSError, AttributeError):
+                        pass
+
+            self.process = await asyncio.create_subprocess_exec(
+                executable,
+                *program_args,
+                stdout=stdout_dest,
+                stderr=stderr_dest,
+                env={**os.environ, **self.config.environment},
+                cwd=self.config.directory,
+                preexec_fn=preexec,
+                start_new_session=True,
+            )
+            await self._change_state(RUNNING)
+            self.logger.info("Started %s (pid %d)", self.config.name, self.process.pid)
+
+            import time as _time
+
+            self._spawn_time = asyncio.get_event_loop().time()
+            self.started_at = _time.time()
+
+            await self._start_health_checks()
+
+            await self.wait()
+
+        except Exception as e:
+            self.logger.error("Failed to spawn %s: %s", self.config.name, e)
+            await self._change_state(FATAL)
+        finally:
+            # Always close file handles to prevent leaks
+            if stdout_file is not None:
+                stdout_file.close()
+            if stderr_file is not None:
+                stderr_file.close()
