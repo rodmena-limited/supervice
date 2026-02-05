@@ -13,3 +13,9 @@ class TestModels(unittest.TestCase):
         self.assertEqual(pc.numprocs, 1)
         self.assertTrue(pc.autostart)
         self.assertIsNone(pc.group)
+
+    def test_supervisor_config_defaults(self):
+        sc = SupervisorConfig()
+        self.assertEqual(sc.logfile, "supervice.log")
+        self.assertEqual(sc.loglevel, "INFO")
+        self.assertEqual(sc.programs, [])
