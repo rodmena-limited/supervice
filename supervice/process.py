@@ -80,3 +80,49 @@ class Process:
                     "pid": self.process.pid if self.process else None,
                 }
                 self.event_bus.publish(Event(type=event_type, payload=payload))
+
+    async def start(self) -> None:
+        """Start the supervision task (system lifecycle)."""
+        if self._task and not self._task.done():
+            return
+        self.stop_event.clear()
+        self._task = asyncio.create_task(self.supervise())
+
+    async def stop(self) -> None:
+        """Stop the supervision task (system lifecycle)."""
+        self.should_run = False
+        self.stop_event.set()
+        await self.kill()
+        if self._task:
+            try:
+                await asyncio.wait_for(self._task, timeout=self.config.stopwaitsecs + 2)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+
+    async def start_process(self) -> None:
+        """Request to start the managed process (RPC)."""
+        async with self._state_lock:
+            if self.state == RUNNING:
+                return
+            self.should_run = True
+            self.backoff = 0  # Reset backoff on manual start
+
+        # Wait for state transition using event-based waiting (not polling)
+        deadline = asyncio.get_event_loop().time() + 5.0  # 5 second timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if self.state == RUNNING:
+                return
+            if self.state == FATAL:
+                raise Exception("Spawn failed")
+            try:
+                # Wait for state change event with remaining timeout
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                await asyncio.wait_for(self._state_changed.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
