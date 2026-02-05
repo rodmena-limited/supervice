@@ -45,3 +45,22 @@ class RPCServer:
             await self.server.wait_closed()
             if os.path.exists(self.socket_path):
                 os.unlink(self.socket_path)
+
+    async def _read_message(self, reader: asyncio.StreamReader) -> bytes | None:
+        """Read a length-prefixed message from the stream."""
+        # Read the 4-byte header
+        header = await reader.readexactly(HEADER_SIZE)
+        if not header:
+            return None
+
+        msg_length = struct.unpack(">I", header)[0]
+
+        if msg_length > MAX_MESSAGE_SIZE:
+            msg = "Message too large: %d bytes (max %d)" % (msg_length, MAX_MESSAGE_SIZE)
+            raise ValueError(msg)
+
+        if msg_length == 0:
+            return b""
+
+        # Read the message body
+        return await reader.readexactly(msg_length)
