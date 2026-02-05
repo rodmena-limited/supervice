@@ -6,10 +6,13 @@ import signal
 import sys
 from asyncio import subprocess
 from typing import IO, Any
+
 from supervice.events import Event, EventBus, EventType
 from supervice.health import HealthChecker, create_health_checker
 from supervice.logger import get_logger
 from supervice.models import HealthCheckType, ProgramConfig
+
+# Process States
 STOPPED = "STOPPED"
 STARTING = "STARTING"
 RUNNING = "RUNNING"
@@ -18,8 +21,11 @@ STOPPING = "STOPPING"
 EXITED = "EXITED"
 FATAL = "FATAL"
 UNHEALTHY = "UNHEALTHY"  # Process is running but health checks failing
+
+# Exit codes for preexec failures (child process signals parent via exit code)
 EXIT_CODE_USER_SWITCH_FAILED = 126  # User switching failed
 EXIT_CODE_PREEXEC_FAILED = 127  # Other preexec failure
+
 
 class Process:
     def __init__(self, config: ProgramConfig, event_bus: EventBus):
@@ -126,6 +132,7 @@ class Process:
                 await asyncio.wait_for(self._state_changed.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 break
+        # If we timed out, it might still be STARTING or BACKOFF
 
     async def stop_process(self) -> None:
         """Request to stop the managed process (RPC)."""
@@ -412,3 +419,70 @@ class Process:
             self._health_failures = 0
             self.is_healthy = None
             self._health_task = asyncio.create_task(self._run_health_checks())
+
+    async def _stop_health_checks(self) -> None:
+        """Stop the health check task."""
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+        self._health_task = None
+
+    async def force_kill(self) -> None:
+        """Immediately SIGKILL the process without graceful shutdown."""
+        await self._stop_health_checks()
+        self.started_at = None
+        async with self._state_lock:
+            self.should_run = False
+
+        if not self.process or self.process.returncode is not None:
+            return
+
+        await self._change_state(STOPPING)
+        try:
+            pgid = os.getpgid(self.process.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+        await self._change_state(STOPPED)
+
+    async def kill(self) -> None:
+        await self._stop_health_checks()
+        self.started_at = None
+
+        if not self.process or self.process.returncode is not None:
+            return
+
+        await self._change_state(STOPPING)
+        self.logger.info("Stopping %s", self.config.name)
+
+        sig = getattr(signal, "SIG%s" % self.config.stopsignal, signal.SIGTERM)
+
+        # Kill entire process group, not just main process
+        try:
+            pgid = os.getpgid(self.process.pid)
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=self.config.stopwaitsecs)
+        except asyncio.TimeoutError:
+            self.logger.warning("%s did not stop, killing process group", self.config.name)
+            try:
+                pgid = os.getpgid(self.process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
+
+        await self._change_state(STOPPED)
