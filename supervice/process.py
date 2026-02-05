@@ -277,3 +277,138 @@ class Process:
                 stdout_file.close()
             if stderr_file is not None:
                 stderr_file.close()
+
+    async def wait(self) -> None:
+        if not self.process:
+            return
+
+        return_code = await self.process.wait()
+
+        # Check for preexec failure codes - these indicate setup errors, not normal exits
+        if return_code == EXIT_CODE_USER_SWITCH_FAILED:
+            self.logger.error(
+                "%s failed: could not switch to user '%s' (exit code %d)",
+                self.config.name,
+                self.config.user,
+                return_code,
+            )
+            await self._change_state(FATAL)
+            return
+        elif return_code == EXIT_CODE_PREEXEC_FAILED:
+            self.logger.error(
+                "%s failed: preexec setup error (exit code %d)", self.config.name, return_code
+            )
+            await self._change_state(FATAL)
+            return
+
+        self.logger.info("%s exited with code %d", self.config.name, return_code)
+
+        runtime = asyncio.get_event_loop().time() - self._spawn_time
+        if runtime >= self.config.startsecs:
+            self.backoff = 0
+
+        await self._change_state(EXITED)
+
+    async def _run_health_checks(self) -> None:
+        """Run health checks periodically while process is running."""
+        if not self._health_checker:
+            return
+
+        hc_config = self.config.healthcheck
+
+        # Wait for start period before beginning health checks
+        if hc_config.start_period > 0:
+            self.logger.debug(
+                "%s: waiting %ds before starting health checks",
+                self.config.name,
+                hc_config.start_period,
+            )
+            await asyncio.sleep(hc_config.start_period)
+
+        running_states = (RUNNING, UNHEALTHY)
+        while self.state in running_states and self.process and self.process.returncode is None:
+            try:
+                result = await self._health_checker.check()
+
+                if result.healthy:
+                    if self._health_failures > 0:
+                        self.logger.info(
+                            "%s: health check passed after %d failures",
+                            self.config.name,
+                            self._health_failures,
+                        )
+                    self._health_failures = 0
+                    self.is_healthy = True
+
+                    # Transition back to RUNNING if we were UNHEALTHY
+                    if self.state == UNHEALTHY:
+                        await self._change_state(RUNNING)
+
+                    # Emit health check passed event
+                    self.event_bus.publish(
+                        Event(
+                            type=EventType.HEALTHCHECK_PASSED,
+                            payload={
+                                "processname": self.config.name,
+                                "message": result.message,
+                                "pid": self.process.pid if self.process else None,
+                            },
+                        )
+                    )
+                else:
+                    self._health_failures += 1
+                    self.logger.warning(
+                        "%s: health check failed (%d/%d): %s",
+                        self.config.name,
+                        self._health_failures,
+                        hc_config.retries,
+                        result.message,
+                    )
+
+                    # Emit health check failed event
+                    self.event_bus.publish(
+                        Event(
+                            type=EventType.HEALTHCHECK_FAILED,
+                            payload={
+                                "processname": self.config.name,
+                                "message": result.message,
+                                "failures": self._health_failures,
+                                "pid": self.process.pid if self.process else None,
+                            },
+                        )
+                    )
+
+                    if self._health_failures >= hc_config.retries:
+                        self.is_healthy = False
+                        self.logger.error(
+                            "%s: health check failed %d times, marking as unhealthy",
+                            self.config.name,
+                            self._health_failures,
+                        )
+
+                        if self.state == RUNNING:
+                            await self._change_state(UNHEALTHY)
+
+                        # Auto-restart on health failure if autorestart is enabled
+                        if self.config.autorestart:
+                            self.logger.info(
+                                "%s: restarting due to health check failures", self.config.name
+                            )
+                            await self.kill()
+                            self._health_failures = 0
+                            return  # Exit health check loop, process will be restarted
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                self.logger.error("%s: health check error: %s", self.config.name, e)
+
+            # Wait for next check interval
+            await asyncio.sleep(hc_config.interval)
+
+    async def _start_health_checks(self) -> None:
+        """Start the health check task if health checks are configured."""
+        if self._health_checker and self.config.healthcheck.type != HealthCheckType.NONE:
+            self._health_failures = 0
+            self.is_healthy = None
+            self._health_task = asyncio.create_task(self._run_health_checks())
