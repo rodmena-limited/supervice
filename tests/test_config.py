@@ -19,3 +19,6 @@ class TestModels(unittest.TestCase):
         self.assertEqual(sc.logfile, "supervice.log")
         self.assertEqual(sc.loglevel, "INFO")
         self.assertEqual(sc.programs, [])
+
+class TestConfigParsing(unittest.TestCase):
+    pass
