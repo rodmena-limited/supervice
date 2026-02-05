@@ -70,3 +70,63 @@ class RPCServer:
         header = struct.pack(">I", len(data))
         writer.write(header + data)
         await writer.drain()
+
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            data = await self._read_message(reader)
+            if data is None:
+                return
+
+            # Parse JSON with proper error handling
+            try:
+                request = json.loads(data.decode("utf-8"))
+            except json.JSONDecodeError as e:
+                self.logger.warning("Invalid JSON in RPC request: %s", e)
+                response = {
+                    "status": "error",
+                    "code": "INVALID_JSON",
+                    "message": "Invalid JSON: %s" % e,
+                }
+                await self._write_message(writer, json.dumps(response).encode("utf-8"))
+                return
+
+            # Validate request structure
+            if not isinstance(request, dict):
+                response = {
+                    "status": "error",
+                    "code": "INVALID_REQUEST",
+                    "message": "Request must be a JSON object",
+                }
+                await self._write_message(writer, json.dumps(response).encode("utf-8"))
+                return
+
+            # Validate command
+            command = request.get("command")
+            if command not in VALID_COMMANDS:
+                self.logger.warning("Unknown RPC command: %s", command)
+                response = {
+                    "status": "error",
+                    "code": "UNKNOWN_COMMAND",
+                    "message": "Unknown command: %s" % command,
+                }
+                await self._write_message(writer, json.dumps(response).encode("utf-8"))
+                return
+
+            response = await self.process_request(request)
+            await self._write_message(writer, json.dumps(response).encode("utf-8"))
+
+        except asyncio.IncompleteReadError:
+            # Client disconnected mid-message
+            self.logger.debug("Client disconnected during read")
+        except Exception as e:
+            self.logger.error("RPC Error: %s", e)
+            try:
+                error_response = {"status": "error", "code": "INTERNAL_ERROR", "message": str(e)}
+                await self._write_message(writer, json.dumps(error_response).encode("utf-8"))
+            except Exception:
+                pass  # Client may have disconnected
+        finally:
+            writer.close()
+            await writer.wait_closed()
