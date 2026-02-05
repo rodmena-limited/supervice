@@ -38,3 +38,10 @@ class RPCServer:
             os.umask(old_umask)
 
         self.logger.info("RPC Server listening on %s", self.socket_path)
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+            if os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
