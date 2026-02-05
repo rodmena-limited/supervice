@@ -3,9 +3,14 @@ import json
 import os
 import struct
 from typing import Any
+
 from supervice.logger import get_logger
+
+# Length-prefixed protocol constants
 HEADER_SIZE = 4  # 4 bytes for message length (uint32, big-endian)
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB max message size
+
+# Valid RPC commands
 VALID_COMMANDS = frozenset(
     {
         "status",
@@ -17,6 +22,7 @@ VALID_COMMANDS = frozenset(
         "reload",
     }
 )
+
 
 class RPCServer:
     def __init__(self, socket_path: str, supervisor: Any):
@@ -130,3 +136,88 @@ class RPCServer:
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def process_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        command = request.get("command")
+
+        if command == "status":
+            import time
+
+            now = time.time()
+            processes = []
+            for name, proc in self.supervisor.processes.items():
+                is_alive = proc.process and proc.process.returncode is None
+                proc_info: dict[str, Any] = {
+                    "name": name,
+                    "state": proc.state,
+                    "pid": proc.process.pid if is_alive else None,
+                }
+                if proc.started_at is not None and is_alive:
+                    proc_info["uptime"] = int(now - proc.started_at)
+                if proc.is_healthy is not None:
+                    proc_info["healthy"] = proc.is_healthy
+                processes.append(proc_info)
+            return {"status": "ok", "processes": processes}
+
+        elif command == "stop":
+            name = request.get("name")
+            if name and name in self.supervisor.processes:
+                await self.supervisor.processes[name].stop_process()
+                return {"status": "ok", "message": "Stopped %s" % name}
+            return {"status": "error", "message": "Process not found"}
+
+        elif command == "start":
+            name = request.get("name")
+            if name and name in self.supervisor.processes:
+                proc = self.supervisor.processes[name]
+                if proc.state == "RUNNING":
+                    return {"status": "ok", "message": "%s is already running" % name}
+                await proc.start_process()
+                return {"status": "ok", "message": "Started %s" % name}
+            return {"status": "error", "message": "Process not found"}
+
+        elif command == "restart":
+            name = request.get("name")
+            force = request.get("force", False)
+            if name and name in self.supervisor.processes:
+                proc = self.supervisor.processes[name]
+                if force:
+                    await proc.force_kill()
+                else:
+                    await proc.stop_process()
+                await proc.start_process()
+                return {"status": "ok", "message": "Restarted %s" % name}
+            return {"status": "error", "message": "Process not found"}
+
+        elif command == "stopgroup":
+            group = request.get("name")
+            if group and group in self.supervisor.groups:
+                tasks = []
+                for proc_name in self.supervisor.groups[group]:
+                    if proc_name in self.supervisor.processes:
+                        tasks.append(self.supervisor.processes[proc_name].stop_process())
+                if tasks:
+                    await asyncio.gather(*tasks)
+                return {"status": "ok", "message": "Stopped group %s" % group}
+            return {"status": "error", "message": "Group not found"}
+
+        elif command == "startgroup":
+            group = request.get("name")
+            if group and group in self.supervisor.groups:
+                tasks = []
+                for proc_name in self.supervisor.groups[group]:
+                    if proc_name in self.supervisor.processes:
+                        tasks.append(self.supervisor.processes[proc_name].start_process())
+                if tasks:
+                    await asyncio.gather(*tasks)
+                return {"status": "ok", "message": "Started group %s" % group}
+            return {"status": "error", "message": "Group not found"}
+
+        elif command == "reload":
+            try:
+                result = await self.supervisor.reload_config()
+                return {"status": "ok", **result}
+            except Exception as e:
+                return {"status": "error", "message": "Reload failed: %s" % e}
+
+        return {"status": "error", "message": "Unknown command"}
