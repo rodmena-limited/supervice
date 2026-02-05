@@ -33,3 +33,12 @@ class TestConfigParsing(unittest.TestCase):
         self.assertFalse(_parse_bool("no"))
         self.assertFalse(_parse_bool("off"))
         self.assertFalse(_parse_bool("random"))
+
+    def test_parse_env(self):
+        env_str = 'KEY1=val1,KEY2="val2", KEY3 = val3 '
+        env = _parse_env(env_str)
+        self.assertEqual(env["KEY1"], "val1")
+        self.assertEqual(env["KEY2"], "val2")
+        self.assertEqual(env["KEY3"], "val3")
+
+        self.assertEqual(_parse_env(""), {})
