@@ -24,3 +24,17 @@ class RPCServer:
         self.supervisor = supervisor
         self.logger = get_logger()
         self.server: asyncio.AbstractServer | None = None
+
+    async def start(self) -> None:
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+
+        # Security: Set umask to create socket with restrictive permissions atomically
+        # This prevents the race condition where socket is world-readable briefly
+        old_umask = os.umask(0o177)  # Results in mode 0o600
+        try:
+            self.server = await asyncio.start_unix_server(self.handle_client, self.socket_path)
+        finally:
+            os.umask(old_umask)
+
+        self.logger.info("RPC Server listening on %s", self.socket_path)
