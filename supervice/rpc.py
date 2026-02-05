@@ -17,3 +17,10 @@ VALID_COMMANDS = frozenset(
         "reload",
     }
 )
+
+class RPCServer:
+    def __init__(self, socket_path: str, supervisor: Any):
+        self.socket_path = socket_path
+        self.supervisor = supervisor
+        self.logger = get_logger()
+        self.server: asyncio.AbstractServer | None = None
