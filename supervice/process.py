@@ -16,3 +16,6 @@ RUNNING = "RUNNING"
 BACKOFF = "BACKOFF"
 STOPPING = "STOPPING"
 EXITED = "EXITED"
+FATAL = "FATAL"
+UNHEALTHY = "UNHEALTHY"  # Process is running but health checks failing
+EXIT_CODE_USER_SWITCH_FAILED = 126  # User switching failed
