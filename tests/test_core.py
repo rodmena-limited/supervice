@@ -31,4 +31,20 @@ class TestEventBus(unittest.TestCase):
         asyncio.run(run())
 
 class TestRPCServer(unittest.TestCase):
-    pass
+
+    def test_server_lifecycle(self):
+        async def run():
+            socket_path = "test_rpc.sock"
+            if os.path.exists(socket_path):
+                os.remove(socket_path)
+
+            supervisor_mock = MagicMock()
+            server = RPCServer(socket_path, supervisor_mock)
+
+            await server.start()
+            self.assertTrue(os.path.exists(socket_path))
+
+            await server.stop()
+            self.assertFalse(os.path.exists(socket_path))
+
+        asyncio.run(run())
