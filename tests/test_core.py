@@ -29,3 +29,6 @@ class TestEventBus(unittest.TestCase):
             self.assertEqual(received_events[0].type, EventType.PROCESS_STATE_STARTING)
 
         asyncio.run(run())
+
+class TestRPCServer(unittest.TestCase):
+    pass
