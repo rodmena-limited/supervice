@@ -42,3 +42,22 @@ class TestLengthPrefixedProtocol(unittest.TestCase):
             self.assertIn("too large", str(ctx.exception).lower())
 
         asyncio.run(run())
+
+    def test_write_message_format(self) -> None:
+        """Test that messages are written with correct header."""
+
+        async def run() -> None:
+            writer = MagicMock()
+            writer.drain = AsyncMock()
+
+            server = RPCServer("sock", MagicMock())
+            message = b'{"status": "ok"}'
+            await server._write_message(writer, message)
+
+            # Check that write was called with header + message
+            call_args = writer.write.call_args[0][0]
+            expected_header = struct.pack(">I", len(message))
+            self.assertEqual(call_args[:HEADER_SIZE], expected_header)
+            self.assertEqual(call_args[HEADER_SIZE:], message)
+
+        asyncio.run(run())
