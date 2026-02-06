@@ -30,3 +30,12 @@ class TestSignalValidation(unittest.TestCase):
         """Test that signals with SIG prefix are handled."""
         # SIGTERM should work (strips SIG prefix)
         _validate_signal("SIGTERM", "test")
+
+class TestDirectoryValidation(unittest.TestCase):
+    """Tests for directory validation."""
+
+    def test_existing_directory_passes(self) -> None:
+        """Test that existing directories pass validation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Should not raise
+            _validate_directory(tmpdir, "test")
