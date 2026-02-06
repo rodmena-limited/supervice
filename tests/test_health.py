@@ -99,3 +99,19 @@ class TestTCPHealthChecker(unittest.TestCase):
             self.assertIn("No port configured", result.message)
 
         asyncio.run(run())
+
+class TestScriptHealthChecker(unittest.TestCase):
+    """Tests for script-based health checks."""
+
+    def test_script_check_success(self) -> None:
+        """Test script check with exit code 0."""
+
+        async def run() -> None:
+            config = HealthCheckConfig(type=HealthCheckType.SCRIPT, command="exit 0", timeout=5)
+            checker = ScriptHealthChecker(config)
+            result = await checker.check()
+
+            self.assertTrue(result.healthy)
+            self.assertIn("code 0", result.message)
+
+        asyncio.run(run())
