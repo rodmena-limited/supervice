@@ -2,6 +2,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+
 from supervice.events import EventBus
 from supervice.models import ProgramConfig
 from supervice.process import (
@@ -13,8 +14,8 @@ from supervice.process import (
     Process,
 )
 
-class TestProcessLifecycle(unittest.TestCase):
 
+class TestProcessLifecycle(unittest.TestCase):
     def setUp(self) -> None:
         self.event_bus = EventBus()
 
@@ -276,3 +277,44 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_start_stop_process_rpc(self) -> None:
+        """Test start_process and stop_process RPC methods."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(
+                name="test",
+                command="sleep 60",
+                autostart=False,
+            )
+            process = Process(config, self.event_bus)
+
+            # Start supervision loop
+            task = asyncio.create_task(process.supervise())
+            await asyncio.sleep(0.1)
+
+            self.assertEqual(process.state, STOPPED)
+
+            # Start process via RPC
+            await process.start_process()
+            self.assertEqual(process.state, RUNNING)
+
+            # Stop process via RPC
+            await process.stop_process()
+            self.assertEqual(process.state, STOPPED)
+
+            # Clean up
+            process.stop_event.set()
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except asyncio.TimeoutError:
+                task.cancel()
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
+
+
+if __name__ == "__main__":
+    unittest.main()
