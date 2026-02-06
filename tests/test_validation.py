@@ -1,6 +1,9 @@
+"""Tests for configuration validation."""
+
 import os
 import tempfile
 import unittest
+
 from supervice.config import (
     ConfigValidationError,
     _validate_directory,
@@ -8,6 +11,7 @@ from supervice.config import (
     _validate_signal,
     parse_config,
 )
+
 
 class TestSignalValidation(unittest.TestCase):
     """Tests for signal name validation."""
@@ -31,6 +35,7 @@ class TestSignalValidation(unittest.TestCase):
         # SIGTERM should work (strips SIG prefix)
         _validate_signal("SIGTERM", "test")
 
+
 class TestDirectoryValidation(unittest.TestCase):
     """Tests for directory validation."""
 
@@ -53,6 +58,7 @@ class TestDirectoryValidation(unittest.TestCase):
                 _validate_directory(f.name, "testprog")
             self.assertIn("not a directory", str(ctx.exception))
 
+
 class TestNumericValidation(unittest.TestCase):
     """Tests for numeric bounds validation."""
 
@@ -68,16 +74,17 @@ class TestNumericValidation(unittest.TestCase):
             _validate_positive_int(-1, "numprocs", "testprog")
         self.assertIn("must be non-negative", str(ctx.exception))
 
+
 class TestConfigValidation(unittest.TestCase):
     """Integration tests for config validation."""
 
     def test_invalid_signal_in_config(self) -> None:
         """Test that invalid stopsignal in config raises error."""
         config_content = """
-    [program:test]
-    command=echo hello
-    stopsignal=INVALID
-    """
+[program:test]
+command=echo hello
+stopsignal=INVALID
+"""
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
             f.write(config_content)
             fname = f.name
@@ -92,9 +99,9 @@ class TestConfigValidation(unittest.TestCase):
     def test_invalid_loglevel_raises(self) -> None:
         """Test that invalid loglevel raises ConfigValidationError."""
         config_content = """
-    [supervice]
-    loglevel=INVALID
-    """
+[supervice]
+loglevel=INVALID
+"""
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
             f.write(config_content)
             fname = f.name
@@ -109,10 +116,10 @@ class TestConfigValidation(unittest.TestCase):
     def test_zero_numprocs_raises(self) -> None:
         """Test that numprocs=0 raises ConfigValidationError."""
         config_content = """
-    [program:test]
-    command=echo hello
-    numprocs=0
-    """
+[program:test]
+command=echo hello
+numprocs=0
+"""
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
             f.write(config_content)
             fname = f.name
@@ -127,19 +134,19 @@ class TestConfigValidation(unittest.TestCase):
     def test_valid_config_with_health_checks(self) -> None:
         """Test that valid config with health checks parses correctly."""
         config_content = """
-    [supervice]
-    loglevel=INFO
-    socket=/tmp/test.sock
-    shutdown_timeout=30
+[supervice]
+loglevel=INFO
+socket=/tmp/test.sock
+shutdown_timeout=30
 
-    [program:webserver]
-    command=python -m http.server 8080
-    healthcheck_type=tcp
-    healthcheck_port=8080
-    healthcheck_interval=10
-    healthcheck_timeout=5
-    healthcheck_retries=3
-    """
+[program:webserver]
+command=python -m http.server 8080
+healthcheck_type=tcp
+healthcheck_port=8080
+healthcheck_interval=10
+healthcheck_timeout=5
+healthcheck_retries=3
+"""
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
             f.write(config_content)
             fname = f.name
@@ -155,3 +162,43 @@ class TestConfigValidation(unittest.TestCase):
             self.assertEqual(prog.healthcheck.interval, 10)
         finally:
             os.remove(fname)
+
+    def test_tcp_healthcheck_missing_port_raises(self) -> None:
+        """Test that TCP health check without port raises error."""
+        config_content = """
+[program:test]
+command=echo hello
+healthcheck_type=tcp
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                parse_config(fname)
+            self.assertIn("healthcheck_port", str(ctx.exception))
+        finally:
+            os.remove(fname)
+
+    def test_script_healthcheck_missing_command_raises(self) -> None:
+        """Test that script health check without command raises error."""
+        config_content = """
+[program:test]
+command=echo hello
+healthcheck_type=script
+"""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                parse_config(fname)
+            self.assertIn("healthcheck_command", str(ctx.exception))
+        finally:
+            os.remove(fname)
+
+
+if __name__ == "__main__":
+    unittest.main()
