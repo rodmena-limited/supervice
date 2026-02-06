@@ -94,3 +94,6 @@ class TestRPCValidation(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
 
         asyncio.run(run())
+
+class TestJSONErrorHandling(unittest.TestCase):
+    """Tests for JSON parsing error handling."""
