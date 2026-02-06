@@ -61,3 +61,12 @@ class TestNumericValidation(unittest.TestCase):
         _validate_positive_int(0, "field", "test")
         _validate_positive_int(1, "field", "test")
         _validate_positive_int(100, "field", "test")
+
+    def test_negative_int_raises(self) -> None:
+        """Test that negative integers raise ConfigValidationError."""
+        with self.assertRaises(ConfigValidationError) as ctx:
+            _validate_positive_int(-1, "numprocs", "testprog")
+        self.assertIn("must be non-negative", str(ctx.exception))
+
+class TestConfigValidation(unittest.TestCase):
+    """Integration tests for config validation."""
