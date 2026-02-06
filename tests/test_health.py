@@ -1,6 +1,9 @@
+"""Tests for health check functionality."""
+
 import asyncio
 import socket
 import unittest
+
 from supervice.health import (
     HealthCheckResult,
     ScriptHealthChecker,
@@ -8,6 +11,7 @@ from supervice.health import (
     create_health_checker,
 )
 from supervice.models import HealthCheckConfig, HealthCheckType
+
 
 class TestHealthCheckResult(unittest.TestCase):
     """Tests for HealthCheckResult class."""
@@ -21,6 +25,7 @@ class TestHealthCheckResult(unittest.TestCase):
         result = HealthCheckResult(False, "Connection refused")
         self.assertFalse(result.healthy)
         self.assertEqual(result.message, "Connection refused")
+
 
 class TestTCPHealthChecker(unittest.TestCase):
     """Tests for TCP health checks."""
@@ -100,6 +105,7 @@ class TestTCPHealthChecker(unittest.TestCase):
 
         asyncio.run(run())
 
+
 class TestScriptHealthChecker(unittest.TestCase):
     """Tests for script-based health checks."""
 
@@ -170,6 +176,7 @@ class TestScriptHealthChecker(unittest.TestCase):
 
         asyncio.run(run())
 
+
 class TestHealthCheckerFactory(unittest.TestCase):
     """Tests for health checker factory function."""
 
@@ -177,3 +184,17 @@ class TestHealthCheckerFactory(unittest.TestCase):
         config = HealthCheckConfig(type=HealthCheckType.TCP, port=8080)
         checker = create_health_checker(config)
         self.assertIsInstance(checker, TCPHealthChecker)
+
+    def test_create_script_checker(self) -> None:
+        config = HealthCheckConfig(type=HealthCheckType.SCRIPT, command="exit 0")
+        checker = create_health_checker(config)
+        self.assertIsInstance(checker, ScriptHealthChecker)
+
+    def test_create_none_checker(self) -> None:
+        config = HealthCheckConfig(type=HealthCheckType.NONE)
+        checker = create_health_checker(config)
+        self.assertIsNone(checker)
+
+
+if __name__ == "__main__":
+    unittest.main()
