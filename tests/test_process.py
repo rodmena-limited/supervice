@@ -35,3 +35,19 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_spawn_failure_command_not_found(self) -> None:
+        """Test spawn with invalid command transitions to FATAL."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(name="test", command="nonexistent_cmd_xyz_12345")
+            process = Process(config, self.event_bus)
+
+            await process.spawn()
+
+            self.assertEqual(process.state, FATAL)
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
