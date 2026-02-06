@@ -2,11 +2,12 @@ import asyncio
 import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock
+
 from supervice.events import Event, EventBus, EventType
 from supervice.rpc import RPCServer
 
-class TestEventBus(unittest.TestCase):
 
+class TestEventBus(unittest.TestCase):
     def test_pub_sub(self):
         async def run():
             bus = EventBus()
@@ -30,8 +31,8 @@ class TestEventBus(unittest.TestCase):
 
         asyncio.run(run())
 
-class TestRPCServer(unittest.TestCase):
 
+class TestRPCServer(unittest.TestCase):
     def test_server_lifecycle(self):
         async def run():
             socket_path = "test_rpc.sock"
@@ -63,5 +64,52 @@ class TestRPCServer(unittest.TestCase):
             response = await server.process_request(request)
 
             self.assertEqual(response["status"], "ok")
+
+        asyncio.run(run())
+
+    def test_process_request_commands(self):
+        async def run():
+            supervisor_mock = MagicMock()
+            proc_mock = AsyncMock()
+            supervisor_mock.processes = {"p1": proc_mock}
+            supervisor_mock.groups = {"g1": ["p1"]}
+
+            server = RPCServer("sock", supervisor_mock)
+
+            # Test Start
+            res = await server.process_request({"command": "start", "name": "p1"})
+            self.assertEqual(res["status"], "ok")
+            proc_mock.start_process.assert_called()
+
+            # Test Start Invalid
+            res = await server.process_request({"command": "start", "name": "bad"})
+            self.assertEqual(res["status"], "error")
+
+            # Test Stop
+            res = await server.process_request({"command": "stop", "name": "p1"})
+            self.assertEqual(res["status"], "ok")
+            proc_mock.stop_process.assert_called()
+
+            # Test Stop Invalid
+            res = await server.process_request({"command": "stop", "name": "bad"})
+            self.assertEqual(res["status"], "error")
+
+            # Test Group Start
+            res = await server.process_request({"command": "startgroup", "name": "g1"})
+            self.assertEqual(res["status"], "ok")
+            self.assertGreaterEqual(proc_mock.start_process.call_count, 2)
+
+            # Test Group Stop
+            res = await server.process_request({"command": "stopgroup", "name": "g1"})
+            self.assertEqual(res["status"], "ok")
+            self.assertGreaterEqual(proc_mock.stop_process.call_count, 2)
+
+            # Test Invalid Group
+            res = await server.process_request({"command": "startgroup", "name": "bad"})
+            self.assertEqual(res["status"], "error")
+
+            # Unknown command
+            res = await server.process_request({"command": "xyz"})
+            self.assertEqual(res["status"], "error")
 
         asyncio.run(run())
