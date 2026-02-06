@@ -141,3 +141,31 @@ class TestScriptHealthChecker(unittest.TestCase):
             self.assertIn("timed out", result.message.lower())
 
         asyncio.run(run())
+
+    def test_script_check_with_stderr(self) -> None:
+        """Test script check captures stderr on failure."""
+
+        async def run() -> None:
+            config = HealthCheckConfig(
+                type=HealthCheckType.SCRIPT, command="echo 'error message' >&2; exit 1", timeout=5
+            )
+            checker = ScriptHealthChecker(config)
+            result = await checker.check()
+
+            self.assertFalse(result.healthy)
+            self.assertIn("error message", result.message)
+
+        asyncio.run(run())
+
+    def test_script_check_no_command(self) -> None:
+        """Test script check fails gracefully when no command is configured."""
+
+        async def run() -> None:
+            config = HealthCheckConfig(type=HealthCheckType.SCRIPT, command=None)
+            checker = ScriptHealthChecker(config)
+            result = await checker.check()
+
+            self.assertFalse(result.healthy)
+            self.assertIn("No command configured", result.message)
+
+        asyncio.run(run())
