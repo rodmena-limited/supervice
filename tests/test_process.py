@@ -189,3 +189,34 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_file_handles_closed_on_success(self) -> None:
+        """Test file handles are closed after successful spawn."""
+
+        async def run() -> None:
+            self.event_bus.start()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                stdout_log = os.path.join(tmpdir, "stdout.log")
+                stderr_log = os.path.join(tmpdir, "stderr.log")
+                config = ProgramConfig(
+                    name="test",
+                    command="sh -c 'echo out; echo err >&2'",
+                    stdout_logfile=stdout_log,
+                    stderr_logfile=stderr_log,
+                )
+                process = Process(config, self.event_bus)
+
+                await process.spawn()
+
+                self.assertEqual(process.state, EXITED)
+
+                # Verify files can be opened and contain expected output
+                with open(stdout_log) as f:
+                    self.assertIn("out", f.read())
+                with open(stderr_log) as f:
+                    self.assertIn("err", f.read())
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
