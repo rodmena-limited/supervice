@@ -113,3 +113,47 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_restart_on_failure(self) -> None:
+        """Test that process restarts after failure with autorestart=True."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(
+                name="test",
+                command="sh -c 'exit 1'",
+                autorestart=True,
+                startretries=3,
+                startsecs=0,
+            )
+            process = Process(config, self.event_bus)
+            process.should_run = True
+
+            spawn_count = 0
+            original_spawn = process.spawn
+
+            async def counting_spawn() -> None:
+                nonlocal spawn_count
+                spawn_count += 1
+                await original_spawn()
+
+            process.spawn = counting_spawn
+
+            # Run supervision loop briefly - enough for a few retries
+            task = asyncio.create_task(process.supervise())
+            await asyncio.sleep(2.5)
+            process.stop_event.set()
+
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except asyncio.TimeoutError:
+                task.cancel()
+
+            # Verify multiple spawn attempts occurred (autorestart working)
+            self.assertGreaterEqual(spawn_count, 2)
+            # Process should be in BACKOFF or EXITED state (retry loop)
+            self.assertIn(process.state, (BACKOFF, EXITED, FATAL))
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
