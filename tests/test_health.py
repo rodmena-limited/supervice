@@ -169,3 +169,11 @@ class TestScriptHealthChecker(unittest.TestCase):
             self.assertIn("No command configured", result.message)
 
         asyncio.run(run())
+
+class TestHealthCheckerFactory(unittest.TestCase):
+    """Tests for health checker factory function."""
+
+    def test_create_tcp_checker(self) -> None:
+        config = HealthCheckConfig(type=HealthCheckType.TCP, port=8080)
+        checker = create_health_checker(config)
+        self.assertIsInstance(checker, TCPHealthChecker)
