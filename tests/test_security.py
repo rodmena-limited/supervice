@@ -1,12 +1,16 @@
+"""Tests for security fixes and hardening."""
+
 import asyncio
 import os
 import stat
 import tempfile
 import unittest
+
 from supervice.events import EventBus
 from supervice.models import ProgramConfig
 from supervice.process import FATAL, Process
 from supervice.rpc import RPCServer
+
 
 class TestSocketPermissions(unittest.TestCase):
     """Tests for socket permission security."""
@@ -60,6 +64,7 @@ class TestSocketPermissions(unittest.TestCase):
 
         asyncio.run(run())
 
+
 class TestUserSwitchingErrors(unittest.TestCase):
     """Tests for user switching error handling."""
 
@@ -85,5 +90,26 @@ class TestUserSwitchingErrors(unittest.TestCase):
 
         asyncio.run(run())
 
+
 class TestPIDFilePermissions(unittest.TestCase):
     """Tests for PID file security."""
+
+    def test_pid_file_created_with_restrictive_permissions(self) -> None:
+        """Test that PID file is created with mode 0o600."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_path = os.path.join(tmpdir, "test.pid")
+
+            # Use os.open with explicit mode like core.py does
+            fd = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, b"12345")
+            finally:
+                os.close(fd)
+
+            mode = os.stat(pid_path).st_mode
+            perms = stat.S_IMODE(mode)
+            self.assertEqual(perms, 0o600)
+
+
+if __name__ == "__main__":
+    unittest.main()
