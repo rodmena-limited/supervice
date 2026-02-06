@@ -62,3 +62,25 @@ class TestSocketPermissions(unittest.TestCase):
 
 class TestUserSwitchingErrors(unittest.TestCase):
     """Tests for user switching error handling."""
+
+    def test_spawn_with_nonexistent_user_logs_error(self) -> None:
+        """Test that spawning with nonexistent user results in FATAL state."""
+
+        async def run() -> None:
+            event_bus = EventBus()
+            event_bus.start()
+
+            # Use a user that definitely doesn't exist
+            config = ProgramConfig(
+                name="test", command="echo hello", user="nonexistent_user_xyz_12345"
+            )
+            process = Process(config, event_bus)
+
+            await process.spawn()
+
+            # Should transition to FATAL due to user switch failure
+            self.assertEqual(process.state, FATAL)
+
+            await event_bus.stop()
+
+        asyncio.run(run())
