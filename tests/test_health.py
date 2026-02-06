@@ -115,3 +115,29 @@ class TestScriptHealthChecker(unittest.TestCase):
             self.assertIn("code 0", result.message)
 
         asyncio.run(run())
+
+    def test_script_check_failure(self) -> None:
+        """Test script check with non-zero exit code."""
+
+        async def run() -> None:
+            config = HealthCheckConfig(type=HealthCheckType.SCRIPT, command="exit 1", timeout=5)
+            checker = ScriptHealthChecker(config)
+            result = await checker.check()
+
+            self.assertFalse(result.healthy)
+            self.assertIn("code 1", result.message)
+
+        asyncio.run(run())
+
+    def test_script_check_timeout(self) -> None:
+        """Test script check times out correctly."""
+
+        async def run() -> None:
+            config = HealthCheckConfig(type=HealthCheckType.SCRIPT, command="sleep 10", timeout=1)
+            checker = ScriptHealthChecker(config)
+            result = await checker.check()
+
+            self.assertFalse(result.healthy)
+            self.assertIn("timed out", result.message.lower())
+
+        asyncio.run(run())
