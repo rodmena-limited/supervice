@@ -61,3 +61,6 @@ class TestLengthPrefixedProtocol(unittest.TestCase):
             self.assertEqual(call_args[HEADER_SIZE:], message)
 
         asyncio.run(run())
+
+class TestRPCValidation(unittest.TestCase):
+    """Tests for RPC request validation."""
