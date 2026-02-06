@@ -16,3 +16,11 @@ class TestHealthCheckResult(unittest.TestCase):
         result = HealthCheckResult(True, "All good")
         self.assertTrue(result.healthy)
         self.assertEqual(result.message, "All good")
+
+    def test_unhealthy_result(self) -> None:
+        result = HealthCheckResult(False, "Connection refused")
+        self.assertFalse(result.healthy)
+        self.assertEqual(result.message, "Connection refused")
+
+class TestTCPHealthChecker(unittest.TestCase):
+    """Tests for TCP health checks."""
