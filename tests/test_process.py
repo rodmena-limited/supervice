@@ -14,4 +14,6 @@ from supervice.process import (
 )
 
 class TestProcessLifecycle(unittest.TestCase):
-    pass
+
+    def setUp(self) -> None:
+        self.event_bus = EventBus()
