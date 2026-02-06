@@ -247,3 +247,32 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_process_with_directory(self) -> None:
+        """Test process runs in specified directory."""
+
+        async def run() -> None:
+            self.event_bus.start()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Resolve symlinks (macOS: /var -> /private/var)
+                tmpdir_resolved = os.path.realpath(tmpdir)
+                out_file = os.path.join(tmpdir, "cwd.txt")
+                config = ProgramConfig(
+                    name="test",
+                    command=f"sh -c 'pwd > {out_file}'",
+                    directory=tmpdir,
+                )
+                process = Process(config, self.event_bus)
+
+                await process.spawn()
+
+                self.assertEqual(process.state, EXITED)
+
+                with open(out_file) as f:
+                    cwd = f.read().strip()
+                self.assertEqual(cwd, tmpdir_resolved)
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
