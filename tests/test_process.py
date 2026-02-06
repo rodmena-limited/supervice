@@ -220,3 +220,30 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_process_with_environment(self) -> None:
+        """Test process runs with custom environment variables."""
+
+        async def run() -> None:
+            self.event_bus.start()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_file = os.path.join(tmpdir, "out.txt")
+                config = ProgramConfig(
+                    name="test",
+                    command=f"sh -c 'echo $MY_VAR > {out_file}'",
+                    environment={"MY_VAR": "test_value"},
+                )
+                process = Process(config, self.event_bus)
+
+                await process.spawn()
+
+                self.assertEqual(process.state, EXITED)
+
+                with open(out_file) as f:
+                    content = f.read().strip()
+                self.assertEqual(content, "test_value")
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
