@@ -84,3 +84,6 @@ class TestUserSwitchingErrors(unittest.TestCase):
             await event_bus.stop()
 
         asyncio.run(run())
+
+class TestPIDFilePermissions(unittest.TestCase):
+    """Tests for PID file security."""
