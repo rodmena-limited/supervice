@@ -39,3 +39,16 @@ class TestDirectoryValidation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Should not raise
             _validate_directory(tmpdir, "test")
+
+    def test_nonexistent_directory_raises(self) -> None:
+        """Test that nonexistent directories raise ConfigValidationError."""
+        with self.assertRaises(ConfigValidationError) as ctx:
+            _validate_directory("/nonexistent/path/xyz12345", "testprog")
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_file_instead_of_directory_raises(self) -> None:
+        """Test that files (not directories) raise ConfigValidationError."""
+        with tempfile.NamedTemporaryFile() as f:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                _validate_directory(f.name, "testprog")
+            self.assertIn("not a directory", str(ctx.exception))
