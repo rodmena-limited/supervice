@@ -51,3 +51,31 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_kill_process(self) -> None:
+        """Test killing a running process transitions to STOPPED."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(name="test", command="sleep 60")
+            process = Process(config, self.event_bus)
+
+            # Start spawn in background
+            spawn_task = asyncio.create_task(process.spawn())
+            await asyncio.sleep(0.3)  # Let it start
+
+            self.assertEqual(process.state, RUNNING)
+
+            await process.kill()
+
+            self.assertEqual(process.state, STOPPED)
+
+            # Clean up spawn task
+            try:
+                await asyncio.wait_for(spawn_task, timeout=1)
+            except asyncio.TimeoutError:
+                spawn_task.cancel()
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
