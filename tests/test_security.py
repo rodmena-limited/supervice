@@ -59,3 +59,6 @@ class TestSocketPermissions(unittest.TestCase):
                 self.assertFalse(os.path.exists(socket_path))
 
         asyncio.run(run())
+
+class TestUserSwitchingErrors(unittest.TestCase):
+    """Tests for user switching error handling."""
