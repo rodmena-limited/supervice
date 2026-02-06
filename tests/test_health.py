@@ -67,3 +67,35 @@ class TestTCPHealthChecker(unittest.TestCase):
                 server_sock.close()
 
         asyncio.run(run())
+
+    def test_tcp_check_timeout(self) -> None:
+        """Test TCP check times out correctly."""
+
+        async def run() -> None:
+            # Use a non-routable IP that will cause timeout
+            config = HealthCheckConfig(
+                type=HealthCheckType.TCP,
+                port=80,
+                host="10.255.255.1",  # Non-routable IP
+                timeout=1,
+            )
+            checker = TCPHealthChecker(config)
+            result = await checker.check()
+
+            self.assertFalse(result.healthy)
+            # Message could be timeout or connection error depending on platform
+
+        asyncio.run(run())
+
+    def test_tcp_check_no_port_configured(self) -> None:
+        """Test TCP check fails gracefully when no port is configured."""
+
+        async def run() -> None:
+            config = HealthCheckConfig(type=HealthCheckType.TCP, port=None, host="127.0.0.1")
+            checker = TCPHealthChecker(config)
+            result = await checker.check()
+
+            self.assertFalse(result.healthy)
+            self.assertIn("No port configured", result.message)
+
+        asyncio.run(run())
