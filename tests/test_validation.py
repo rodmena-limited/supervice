@@ -105,3 +105,53 @@ class TestConfigValidation(unittest.TestCase):
             self.assertIn("loglevel", str(ctx.exception).lower())
         finally:
             os.remove(fname)
+
+    def test_zero_numprocs_raises(self) -> None:
+        """Test that numprocs=0 raises ConfigValidationError."""
+        config_content = """
+    [program:test]
+    command=echo hello
+    numprocs=0
+    """
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                parse_config(fname)
+            self.assertIn("numprocs", str(ctx.exception))
+        finally:
+            os.remove(fname)
+
+    def test_valid_config_with_health_checks(self) -> None:
+        """Test that valid config with health checks parses correctly."""
+        config_content = """
+    [supervice]
+    loglevel=INFO
+    socket=/tmp/test.sock
+    shutdown_timeout=30
+
+    [program:webserver]
+    command=python -m http.server 8080
+    healthcheck_type=tcp
+    healthcheck_port=8080
+    healthcheck_interval=10
+    healthcheck_timeout=5
+    healthcheck_retries=3
+    """
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            config = parse_config(fname)
+            self.assertEqual(config.socket_path, "/tmp/test.sock")
+            self.assertEqual(config.shutdown_timeout, 30)
+            self.assertEqual(len(config.programs), 1)
+
+            prog = config.programs[0]
+            self.assertEqual(prog.healthcheck.port, 8080)
+            self.assertEqual(prog.healthcheck.interval, 10)
+        finally:
+            os.remove(fname)
