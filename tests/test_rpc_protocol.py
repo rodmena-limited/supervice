@@ -78,3 +78,19 @@ class TestRPCValidation(unittest.TestCase):
             self.assertEqual(result["status"], "error")
 
         asyncio.run(run())
+
+    def test_valid_commands_accepted(self) -> None:
+        """Test that valid commands are processed."""
+
+        async def run() -> None:
+            supervisor = MagicMock()
+            supervisor.processes = {}
+            supervisor.groups = {}
+
+            server = RPCServer("sock", supervisor)
+
+            # Test status command
+            result = await server.process_request({"command": "status"})
+            self.assertEqual(result["status"], "ok")
+
+        asyncio.run(run())
