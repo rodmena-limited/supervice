@@ -64,3 +64,17 @@ class TestLengthPrefixedProtocol(unittest.TestCase):
 
 class TestRPCValidation(unittest.TestCase):
     """Tests for RPC request validation."""
+
+    def test_unknown_command_rejected(self) -> None:
+        """Test that unknown commands are rejected with proper error."""
+
+        async def run() -> None:
+            supervisor = MagicMock()
+            supervisor.processes = {}
+
+            server = RPCServer("sock", supervisor)
+            result = await server.process_request({"command": "invalid_xyz"})
+
+            self.assertEqual(result["status"], "error")
+
+        asyncio.run(run())
