@@ -157,3 +157,35 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_file_handles_closed_on_error(self) -> None:
+        """Test file handles are closed even if spawn fails."""
+
+        async def run() -> None:
+            self.event_bus.start()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_file = os.path.join(tmpdir, "test.log")
+                config = ProgramConfig(
+                    name="test",
+                    command="nonexistent_cmd_xyz_12345",
+                    stdout_logfile=log_file,
+                )
+                process = Process(config, self.event_bus)
+
+                await process.spawn()
+
+                self.assertEqual(process.state, FATAL)
+
+                # File should be closed - we can open it again without issue
+                with open(log_file, "a") as f:
+                    f.write("test")
+
+                # Verify file exists and has content
+                with open(log_file) as f:
+                    content = f.read()
+                self.assertEqual(content, "test")
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
