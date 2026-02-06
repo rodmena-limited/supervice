@@ -79,3 +79,37 @@ class TestProcessLifecycle(unittest.TestCase):
             await self.event_bus.stop()
 
         asyncio.run(run())
+
+    def test_kill_process_group(self) -> None:
+        """Test that kill terminates child processes too."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            # Script that spawns a child process
+            cmd = "sh -c 'sleep 60 & sleep 60'"
+            config = ProgramConfig(name="test", command=cmd)
+            process = Process(config, self.event_bus)
+
+            spawn_task = asyncio.create_task(process.spawn())
+            await asyncio.sleep(0.3)  # Let processes start
+
+            self.assertEqual(process.state, RUNNING)
+            pid = process.process.pid
+
+            await process.kill()
+
+            self.assertEqual(process.state, STOPPED)
+
+            # Verify process group is gone - attempting to get pgid should fail
+            await asyncio.sleep(0.1)  # Small delay for cleanup
+            with self.assertRaises(ProcessLookupError):
+                os.getpgid(pid)
+
+            try:
+                await asyncio.wait_for(spawn_task, timeout=1)
+            except asyncio.TimeoutError:
+                spawn_task.cancel()
+
+            await self.event_bus.stop()
+
+        asyncio.run(run())
