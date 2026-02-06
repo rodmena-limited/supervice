@@ -70,3 +70,38 @@ class TestNumericValidation(unittest.TestCase):
 
 class TestConfigValidation(unittest.TestCase):
     """Integration tests for config validation."""
+
+    def test_invalid_signal_in_config(self) -> None:
+        """Test that invalid stopsignal in config raises error."""
+        config_content = """
+    [program:test]
+    command=echo hello
+    stopsignal=INVALID
+    """
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                parse_config(fname)
+            self.assertIn("stopsignal", str(ctx.exception).lower())
+        finally:
+            os.remove(fname)
+
+    def test_invalid_loglevel_raises(self) -> None:
+        """Test that invalid loglevel raises ConfigValidationError."""
+        config_content = """
+    [supervice]
+    loglevel=INVALID
+    """
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write(config_content)
+            fname = f.name
+
+        try:
+            with self.assertRaises(ConfigValidationError) as ctx:
+                parse_config(fname)
+            self.assertIn("loglevel", str(ctx.exception).lower())
+        finally:
+            os.remove(fname)
