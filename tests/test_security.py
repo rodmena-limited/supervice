@@ -39,3 +39,23 @@ class TestSocketPermissions(unittest.TestCase):
                     await server.stop()
 
         asyncio.run(run())
+
+    def test_socket_cleaned_up_on_stop(self) -> None:
+        """Test that socket file is removed on stop."""
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                socket_path = os.path.join(tmpdir, "test.sock")
+
+                class MockSupervisor:
+                    processes: dict = {}
+                    groups: dict = {}
+
+                server = RPCServer(socket_path, MockSupervisor())
+                await server.start()
+                self.assertTrue(os.path.exists(socket_path))
+
+                await server.stop()
+                self.assertFalse(os.path.exists(socket_path))
+
+        asyncio.run(run())
