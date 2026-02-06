@@ -52,3 +52,12 @@ class TestDirectoryValidation(unittest.TestCase):
             with self.assertRaises(ConfigValidationError) as ctx:
                 _validate_directory(f.name, "testprog")
             self.assertIn("not a directory", str(ctx.exception))
+
+class TestNumericValidation(unittest.TestCase):
+    """Tests for numeric bounds validation."""
+
+    def test_positive_int_passes(self) -> None:
+        """Test that positive integers pass validation."""
+        _validate_positive_int(0, "field", "test")
+        _validate_positive_int(1, "field", "test")
+        _validate_positive_int(100, "field", "test")
