@@ -83,6 +83,21 @@ programs=prog1
         with self.assertRaises(FileNotFoundError):
             parse_config("nonexistent_file.conf")
 
+    def test_parse_config_unreadable_file_raises(self):
+        """L4: an unreadable config must raise, not be silently swallowed."""
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".conf") as f:
+            f.write("[program:x]\ncommand=sleep 1\n")
+            fname = f.name
+        os.chmod(fname, 0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                parse_config(fname)
+        finally:
+            os.chmod(fname, 0o644)
+            os.remove(fname)
+
     def test_parse_config_missing_command(self):
         config_content = """
 [program:bad]

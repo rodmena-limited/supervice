@@ -315,6 +315,83 @@ class TestProcessLifecycle(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_exit_code_127_not_treated_as_preexec_failure(self) -> None:
+        """C1: a program exiting 127 must go EXITED (restartable), not FATAL."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(
+                name="test",
+                command="sh -c 'exit 127'",
+                autorestart=True,
+                startretries=3,
+                startsecs=0,
+            )
+            process = Process(config, self.event_bus)
+            await process.spawn()
+            self.assertEqual(process.state, EXITED)
+            self.assertEqual(process.process.returncode, 127)
+            await self.event_bus.stop()
+
+        asyncio.run(run())
+
+    def test_exit_code_126_not_treated_as_user_switch_failure(self) -> None:
+        """C1: a program (no user set) exiting 126 must go EXITED, not FATAL."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(name="test", command="sh -c 'exit 126'", startsecs=0)
+            process = Process(config, self.event_bus)
+            await process.spawn()
+            self.assertEqual(process.state, EXITED)
+            self.assertEqual(process.process.returncode, 126)
+            await self.event_bus.stop()
+
+        asyncio.run(run())
+
+    def test_start_process_returns_promptly_via_supervise(self) -> None:
+        """C3: start_process must observe the RUNNING transition, not hang."""
+
+        async def run() -> None:
+            self.event_bus.start()
+            config = ProgramConfig(name="test", command="sleep 60", autostart=False)
+            process = Process(config, self.event_bus)
+
+            task = asyncio.create_task(process.supervise())
+            await asyncio.sleep(0.05)
+            self.assertEqual(process.state, STOPPED)
+
+            start = asyncio.get_event_loop().time()
+            await process.start_process()
+            elapsed = asyncio.get_event_loop().time() - start
+
+            self.assertEqual(process.state, RUNNING)
+            # Must resolve well under the 5s internal timeout.
+            self.assertLess(elapsed, 3.0)
+
+            process.stop_event.set()
+            await process.kill()
+            try:
+                await asyncio.wait_for(task, timeout=2)
+            except asyncio.TimeoutError:
+                task.cancel()
+            await self.event_bus.stop()
+
+        asyncio.run(run())
+
+    def test_change_state_leaves_event_set_for_late_waiter(self) -> None:
+        """C3: _change_state must not set-then-clear; a late waiter still sees it."""
+
+        async def run() -> None:
+            config = ProgramConfig(name="test", command="sleep 60")
+            process = Process(config, self.event_bus)
+            await process._change_state(RUNNING)
+            # Event stays set after the transition so a waiter arriving late
+            # does not block on an already-happened change.
+            self.assertTrue(process._state_changed.is_set())
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

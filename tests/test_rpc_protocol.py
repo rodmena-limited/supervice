@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import os
 import struct
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -115,6 +117,90 @@ class TestJSONErrorHandling(unittest.TestCase):
                 self.fail("Should have raised JSONDecodeError")
             except json.JSONDecodeError:
                 pass  # Expected
+
+        asyncio.run(run())
+
+    def test_empty_request_reported_clearly(self) -> None:
+        """L3: a zero-length request body returns EMPTY_REQUEST, not Invalid JSON."""
+
+        async def run() -> None:
+            # A framed zero-length body: 4-byte header of 0, then no payload.
+            reader = asyncio.StreamReader()
+            reader.feed_data(struct.pack(">I", 0))
+            reader.feed_eof()
+
+            written = []
+
+            class FakeWriter:
+                def write(self, data: bytes) -> None:
+                    written.append(data)
+
+                async def drain(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+                async def wait_closed(self) -> None:
+                    pass
+
+            server = RPCServer("sock", MagicMock())
+            await server.handle_client(reader, FakeWriter())
+
+            payload = b"".join(written)[HEADER_SIZE:]
+            response = json.loads(payload.decode("utf-8"))
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["code"], "EMPTY_REQUEST")
+
+        asyncio.run(run())
+
+
+class TestSocketHijackProtection(unittest.TestCase):
+    """H2: starting must not unlink a socket that a live instance owns."""
+
+    def test_refuses_to_hijack_live_socket(self) -> None:
+        async def run() -> None:
+            tmpdir = tempfile.mkdtemp()
+            socket_path = os.path.join(tmpdir, "live.sock")
+
+            supervisor = MagicMock()
+            supervisor.processes = {}
+            supervisor.groups = {}
+
+            first = RPCServer(socket_path, supervisor)
+            await first.start()
+            try:
+                # A second server on the same live socket must refuse, not hijack.
+                second = RPCServer(socket_path, supervisor)
+                with self.assertRaises(RuntimeError):
+                    await second.start()
+                # The original socket is still there and owned by `first`.
+                self.assertTrue(os.path.exists(socket_path))
+            finally:
+                await first.stop()
+
+        asyncio.run(run())
+
+    def test_stale_socket_is_replaced(self) -> None:
+        async def run() -> None:
+            tmpdir = tempfile.mkdtemp()
+            socket_path = os.path.join(tmpdir, "stale.sock")
+
+            # Create a plain (non-listening) file at the socket path.
+            with open(socket_path, "w"):
+                pass
+            self.assertTrue(os.path.exists(socket_path))
+
+            supervisor = MagicMock()
+            supervisor.processes = {}
+            supervisor.groups = {}
+
+            server = RPCServer(socket_path, supervisor)
+            await server.start()  # should replace the stale file
+            try:
+                self.assertTrue(os.path.exists(socket_path))
+            finally:
+                await server.stop()
 
         asyncio.run(run())
 

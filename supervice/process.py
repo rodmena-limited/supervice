@@ -22,9 +22,15 @@ EXITED = "EXITED"
 FATAL = "FATAL"
 UNHEALTHY = "UNHEALTHY"  # Process is running but health checks failing
 
-# Exit codes for preexec failures (child process signals parent via exit code)
+# Exit code used by the child when preexec setup fails. This is only used for a
+# human-readable exit status in logs; the parent detects preexec failure via a
+# dedicated status pipe (see spawn/_read_preexec_status), NOT via the exit code.
+# Overloading exit codes is unreliable because a real program can legitimately
+# exit with any code (e.g. 126/127 mean "cannot exec"/"not found" under a shell).
 EXIT_CODE_USER_SWITCH_FAILED = 126  # User switching failed
-EXIT_CODE_PREEXEC_FAILED = 127  # Other preexec failure
+
+# Single-byte markers written to the preexec status pipe on failure.
+_PREEXEC_USER_SWITCH_FAILED = b"U"
 
 
 class Process:
@@ -55,9 +61,10 @@ class Process:
             old_state = self.state
             self.state = new_state
 
-            # Signal that state has changed (for waiters in start_process)
+            # Signal that state has changed (for waiters in start_process).
+            # Only set here; waiters clear it before re-checking state so no
+            # edge is lost (see start_process). Do NOT clear inside the setter.
             self._state_changed.set()
-            self._state_changed.clear()
 
             # Map state string to EventType
             event_type = None
@@ -117,18 +124,22 @@ class Process:
             self.should_run = True
             self.backoff = 0  # Reset backoff on manual start
 
-        # Wait for state transition using event-based waiting (not polling)
+        # Wait for state transition using event-based waiting (not polling).
+        # Clear the event *before* re-checking state so we never miss a
+        # transition: if the state is already terminal we return immediately;
+        # otherwise any subsequent _change_state() set() will wake the wait().
         deadline = asyncio.get_event_loop().time() + 5.0  # 5 second timeout
         while asyncio.get_event_loop().time() < deadline:
+            self._state_changed.clear()
             if self.state == RUNNING:
                 return
             if self.state == FATAL:
                 raise Exception("Spawn failed")
+            # Wait for state change event with remaining timeout
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
             try:
-                # Wait for state change event with remaining timeout
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    break
                 await asyncio.wait_for(self._state_changed.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 break
@@ -186,6 +197,13 @@ class Process:
         stdout_file: IO[Any] | None = None
         stderr_file: IO[Any] | None = None
 
+        # Status pipe: preexec writes a marker byte on failure. On success it
+        # writes nothing and the write end (CLOEXEC) auto-closes at exec time,
+        # giving the parent EOF. This lets us distinguish a genuine preexec
+        # failure from a real program that happens to exit with code 126/127.
+        err_read: int | None = None
+        err_write: int | None = None
+
         try:
             # Simple file logging
             if self.config.stdout_logfile:
@@ -213,6 +231,11 @@ class Process:
             # Store user for preexec closure (avoid late binding issues)
             target_user = self.config.user
 
+            err_read, err_write = os.pipe()
+            # Capture the write fd in a local so the closure does not depend on
+            # the outer variable (which the parent sets to None after closing).
+            status_fd = err_write
+
             def preexec() -> None:
                 # User switching - must happen first before any other setup
                 if target_user:
@@ -229,16 +252,19 @@ class Process:
                         os.setgid(pw_record.pw_gid)
                         os.setuid(pw_record.pw_uid)
                     except KeyError:
-                        # User not found - write to stderr before exit
+                        # User not found - signal parent then exit before exec
+                        os.write(status_fd, _PREEXEC_USER_SWITCH_FAILED)
                         sys.stderr.write("supervice: user '%s' not found\n" % target_user)
                         sys.stderr.flush()
                         os._exit(EXIT_CODE_USER_SWITCH_FAILED)
                     except PermissionError:
+                        os.write(status_fd, _PREEXEC_USER_SWITCH_FAILED)
                         msg = "supervice: permission denied switching to user '%s'\n"
                         sys.stderr.write(msg % target_user)
                         sys.stderr.flush()
                         os._exit(EXIT_CODE_USER_SWITCH_FAILED)
                     except OSError as e:
+                        os.write(status_fd, _PREEXEC_USER_SWITCH_FAILED)
                         msg = "supervice: failed to switch to user '%s': %s\n"
                         sys.stderr.write(msg % (target_user, e))
                         sys.stderr.flush()
@@ -263,6 +289,28 @@ class Process:
                 preexec_fn=preexec,
                 start_new_session=True,
             )
+
+            # Close the parent's copy of the write end so the read below can
+            # observe EOF once the child execs (or exits after signalling).
+            os.close(err_write)
+            err_write = None
+
+            preexec_status = await self._read_preexec_status(err_read)
+            if preexec_status:
+                # Child failed during preexec (e.g. user switch). Reap it and
+                # go FATAL — this is a genuine setup failure, not a program exit.
+                self.logger.error(
+                    "%s failed: could not switch to user '%s' (preexec setup error)",
+                    self.config.name,
+                    self.config.user,
+                )
+                try:
+                    await self.process.wait()
+                except Exception:
+                    pass
+                await self._change_state(FATAL)
+                return
+
             await self._change_state(RUNNING)
             self.logger.info("Started %s (pid %d)", self.config.name, self.process.pid)
 
@@ -279,34 +327,46 @@ class Process:
             self.logger.error("Failed to spawn %s: %s", self.config.name, e)
             await self._change_state(FATAL)
         finally:
-            # Always close file handles to prevent leaks
+            # Always close pipe fds and file handles to prevent leaks
+            if err_write is not None:
+                os.close(err_write)
+            if err_read is not None:
+                os.close(err_read)
             if stdout_file is not None:
                 stdout_file.close()
             if stderr_file is not None:
                 stderr_file.close()
+
+    async def _read_preexec_status(self, fd: int) -> bytes:
+        """Read the preexec status pipe until EOF.
+
+        Returns a non-empty bytes marker if the child signalled a preexec
+        failure, or b"" if preexec succeeded (write end closed at exec time).
+        The read runs in a thread so it never blocks the event loop; because the
+        write end is CLOEXEC, EOF arrives the moment the child execs, so this
+        returns promptly even for long-running processes.
+        """
+
+        def _read_all() -> bytes:
+            chunks = []
+            try:
+                while True:
+                    chunk = os.read(fd, 64)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except OSError:
+                pass
+            return b"".join(chunks)
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _read_all)
 
     async def wait(self) -> None:
         if not self.process:
             return
 
         return_code = await self.process.wait()
-
-        # Check for preexec failure codes - these indicate setup errors, not normal exits
-        if return_code == EXIT_CODE_USER_SWITCH_FAILED:
-            self.logger.error(
-                "%s failed: could not switch to user '%s' (exit code %d)",
-                self.config.name,
-                self.config.user,
-                return_code,
-            )
-            await self._change_state(FATAL)
-            return
-        elif return_code == EXIT_CODE_PREEXEC_FAILED:
-            self.logger.error(
-                "%s failed: preexec setup error (exit code %d)", self.config.name, return_code
-            )
-            await self._change_state(FATAL)
-            return
 
         self.logger.info("%s exited with code %d", self.config.name, return_code)
 

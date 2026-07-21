@@ -44,29 +44,23 @@ class TCPHealthChecker(HealthChecker):
         port = self.config.port
         timeout = self.config.timeout
 
+        loop = asyncio.get_event_loop()
         try:
-            # Use asyncio to create a non-blocking socket connection
-            loop = asyncio.get_event_loop()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setblocking(False)
-
-            try:
+            # The context manager guarantees the socket is closed on every exit
+            # path — including a bare Exception or CancelledError propagating out
+            # (cancellation is a BaseException and would otherwise leak the fd).
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setblocking(False)
                 await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=timeout)
-                sock.close()
-                return HealthCheckResult(True, "TCP connection to %s:%d succeeded" % (host, port))
-            except asyncio.TimeoutError:
-                sock.close()
-                return HealthCheckResult(
-                    False, "TCP connection to %s:%d timed out after %ds" % (host, port, timeout)
-                )
-            except ConnectionRefusedError:
-                sock.close()
-                return HealthCheckResult(False, "TCP connection to %s:%d refused" % (host, port))
-            except OSError as e:
-                sock.close()
-                return HealthCheckResult(
-                    False, "TCP connection to %s:%d failed: %s" % (host, port, e)
-                )
+            return HealthCheckResult(True, "TCP connection to %s:%d succeeded" % (host, port))
+        except asyncio.TimeoutError:
+            return HealthCheckResult(
+                False, "TCP connection to %s:%d timed out after %ds" % (host, port, timeout)
+            )
+        except ConnectionRefusedError:
+            return HealthCheckResult(False, "TCP connection to %s:%d refused" % (host, port))
+        except OSError as e:
+            return HealthCheckResult(False, "TCP connection to %s:%d failed: %s" % (host, port, e))
         except Exception as e:
             return HealthCheckResult(False, "TCP health check error: %s" % e)
 

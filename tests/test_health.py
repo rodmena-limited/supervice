@@ -105,6 +105,36 @@ class TestTCPHealthChecker(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_tcp_check_no_fd_leak_on_cancel(self) -> None:
+        """M4: cancelling an in-flight TCP check must not leak the socket fd."""
+
+        async def run() -> None:
+            import os
+
+            fd_dir = "/proc/self/fd"
+            if not os.path.isdir(fd_dir):
+                self.skipTest("no /proc/self/fd on this platform")
+
+            config = HealthCheckConfig(
+                type=HealthCheckType.TCP, port=9, host="10.255.255.1", timeout=30
+            )
+
+            before = len(os.listdir(fd_dir))
+            for _ in range(30):
+                task = asyncio.create_task(TCPHealthChecker(config).check())
+                await asyncio.sleep(0)  # let it reach the connect await
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            after = len(os.listdir(fd_dir))
+
+            # Allow a tiny slack for event-loop internals, but not ~30 leaked fds.
+            self.assertLessEqual(after - before, 3)
+
+        asyncio.run(run())
+
 
 class TestScriptHealthChecker(unittest.TestCase):
     """Tests for script-based health checks."""

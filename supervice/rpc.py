@@ -31,8 +31,41 @@ class RPCServer:
         self.logger = get_logger()
         self.server: asyncio.AbstractServer | None = None
 
+    async def _is_socket_alive(self) -> bool:
+        """Return True if a live instance is already listening on the socket.
+
+        Attempts to connect and exchange a ``status`` request. A refused/failed
+        connection means the socket is stale and safe to remove.
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self.socket_path), timeout=1.0
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False
+        try:
+            request = json.dumps({"command": "status"}).encode("utf-8")
+            await self._write_message(writer, request)
+            data = await asyncio.wait_for(self._read_message(reader), timeout=1.0)
+            return data is not None
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+            return False
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
+            # Never blindly unlink: an existing socket may belong to a live
+            # instance (e.g. when the pidfile lock is disabled). Only remove it
+            # if nothing responds on it.
+            if await self._is_socket_alive():
+                msg = "Another supervice instance is already listening on %s" % self.socket_path
+                self.logger.critical(msg)
+                raise RuntimeError(msg)
             os.unlink(self.socket_path)
 
         # Security: Set umask to create socket with restrictive permissions atomically
@@ -83,6 +116,17 @@ class RPCServer:
         try:
             data = await self._read_message(reader)
             if data is None:
+                return
+
+            # A zero-length body is a valid frame but not valid JSON; report it
+            # clearly instead of surfacing a confusing JSONDecodeError.
+            if not data:
+                response = {
+                    "status": "error",
+                    "code": "EMPTY_REQUEST",
+                    "message": "Empty request",
+                }
+                await self._write_message(writer, json.dumps(response).encode("utf-8"))
                 return
 
             # Parse JSON with proper error handling

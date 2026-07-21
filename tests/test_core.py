@@ -1,8 +1,10 @@
 import asyncio
 import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
+from supervice.core import Supervisor
 from supervice.events import Event, EventBus, EventType
 from supervice.rpc import RPCServer
 
@@ -113,3 +115,118 @@ class TestRPCServer(unittest.TestCase):
             self.assertEqual(res["status"], "error")
 
         asyncio.run(run())
+
+
+def _write_config(body: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=".conf")
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+    return path
+
+
+class TestReloadGroupReconciliation(unittest.TestCase):
+    """C2: reload_config must reconcile groups with the new config."""
+
+    BASE = """
+[supervice]
+pidfile=
+socket=/tmp/supervice_test_reload.sock
+
+[program:worker]
+command=sleep 60
+autostart=false
+
+[program:other]
+command=sleep 60
+autostart=false
+"""
+
+    def test_added_group_appears_after_reload(self) -> None:
+        async def run() -> None:
+            path = _write_config(self.BASE)
+            sup = Supervisor()
+            sup.load_config(path)
+            self.assertNotIn("mygroup", sup.groups)
+
+            with open(path, "w") as f:
+                f.write(self.BASE + "\n[group:mygroup]\nprograms=worker,other\n")
+            await sup.reload_config()
+
+            self.assertIn("mygroup", sup.groups)
+            self.assertEqual(sorted(sup.groups["mygroup"]), ["other", "worker"])
+            os.remove(path)
+
+        asyncio.run(run())
+
+    def test_removed_group_gone_after_reload(self) -> None:
+        async def run() -> None:
+            with_group = self.BASE + "\n[group:mygroup]\nprograms=worker,other\n"
+            path = _write_config(with_group)
+            sup = Supervisor()
+            sup.load_config(path)
+            self.assertIn("mygroup", sup.groups)
+
+            with open(path, "w") as f:
+                f.write(self.BASE)
+            await sup.reload_config()
+
+            self.assertNotIn("mygroup", sup.groups)
+            os.remove(path)
+
+        asyncio.run(run())
+
+    def test_program_moved_between_groups(self) -> None:
+        async def run() -> None:
+            g1 = self.BASE + "\n[group:g1]\nprograms=worker\n[group:g2]\nprograms=other\n"
+            path = _write_config(g1)
+            sup = Supervisor()
+            sup.load_config(path)
+            self.assertIn("worker", sup.groups["g1"])
+            self.assertNotIn("worker", sup.groups.get("g2", []))
+
+            # Move worker from g1 to g2.
+            g2 = self.BASE + "\n[group:g1]\nprograms=\n[group:g2]\nprograms=worker,other\n"
+            with open(path, "w") as f:
+                f.write(g2)
+            await sup.reload_config()
+
+            self.assertNotIn("worker", sup.groups.get("g1", []))
+            self.assertIn("worker", sup.groups["g2"])
+            os.remove(path)
+
+        asyncio.run(run())
+
+
+class TestPidfileSafety(unittest.TestCase):
+    """H3: pidfile must only be removed when it holds our own PID."""
+
+    def test_foreign_pidfile_not_removed(self) -> None:
+        d = tempfile.mkdtemp()
+        pidpath = os.path.join(d, "x.pid")
+        with open(pidpath, "w") as f:
+            f.write("999999")  # some other process's PID
+
+        sup = Supervisor()
+        sup.config.pidfile = pidpath
+        sup._pidfile_fd = os.open(pidpath, os.O_WRONLY)
+        sup._release_pidfile_lock()
+
+        self.assertTrue(os.path.exists(pidpath), "foreign pidfile must be preserved")
+        os.remove(pidpath)
+
+    def test_own_pidfile_removed(self) -> None:
+        d = tempfile.mkdtemp()
+        pidpath = os.path.join(d, "x.pid")
+        with open(pidpath, "w") as f:
+            f.write(str(os.getpid()))
+
+        sup = Supervisor()
+        sup.config.pidfile = pidpath
+        sup._pidfile_fd = os.open(pidpath, os.O_WRONLY)
+        sup._release_pidfile_lock()
+
+        self.assertFalse(os.path.exists(pidpath), "our own pidfile must be removed")
+
+
+if __name__ == "__main__":
+    unittest.main()

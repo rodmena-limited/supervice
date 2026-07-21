@@ -75,6 +75,16 @@ healthcheck_start_period = 15
 - Verifying external dependencies (database connectivity, API availability)
 - Custom health logic that can't be expressed as a TCP check
 
+### Security
+
+> **Warning:** `healthcheck_command` is executed through a shell
+> (`/bin/sh -c`), so it runs **arbitrary code as the user Supervice runs as**.
+> Anyone who can write the configuration file — including a CI/CD system that
+> interpolates environment variables into it — can achieve arbitrary command
+> execution. Treat the config file as trusted input: restrict who can write it,
+> avoid interpolating untrusted values into `healthcheck_command`, and prefer
+> `healthcheck_type = tcp` when a simple connectivity check is sufficient.
+
 ### Example Health Check Scripts
 
 **Check an HTTP endpoint:**

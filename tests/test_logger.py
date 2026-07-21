@@ -26,7 +26,7 @@ class TestLogger(unittest.TestCase):
             self.assertEqual(logger.level, logging.WARN)
             self.assertTrue(any(isinstance(h, logging.FileHandler) for h in logger.handlers))
 
-            logger.warn("Test Message")
+            logger.warning("Test Message")
 
             # Verify write
             with open(fname) as f:

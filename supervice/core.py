@@ -6,7 +6,7 @@ from dataclasses import replace
 
 from supervice.config import parse_config
 from supervice.events import EventBus
-from supervice.logger import get_logger, setup_logger
+from supervice.logger import get_logger
 from supervice.models import ProgramConfig, SupervisorConfig
 from supervice.process import Process
 from supervice.rpc import RPCServer
@@ -29,13 +29,6 @@ class Supervisor:
         self._config_path = path
         try:
             self.config = parse_config(path)
-            # Re-setup logger with config values
-            setup_logger(
-                level=self.config.loglevel,
-                logfile=self.config.logfile,
-                maxbytes=self.config.log_maxbytes,
-                backups=self.config.log_backups,
-            )
             # Initialize RPC server with configured socket path
             self.rpc_server = RPCServer(self.config.socket_path, self)
         except Exception as e:
@@ -43,6 +36,7 @@ class Supervisor:
             raise
 
         self._create_processes(self.config.programs)
+        self._rebuild_groups(self.config.programs)
 
     @staticmethod
     def _expand_logfile(path: str | None, process_num: int) -> str | None:
@@ -50,16 +44,30 @@ class Supervisor:
             return None
         return path.replace("%(process_num)s", "%02d" % process_num)
 
+    @staticmethod
+    def _instance_names(prog_config: ProgramConfig) -> list[str]:
+        """Return the process instance name(s) a program config expands to."""
+        if prog_config.numprocs > 1:
+            return ["%s:%02d" % (prog_config.name, i) for i in range(prog_config.numprocs)]
+        return [prog_config.name]
+
     def _create_processes(
         self,
         programs: list[ProgramConfig],
     ) -> None:
         for prog_config in programs:
-            group_name = prog_config.group if prog_config.group else prog_config.name
-            if group_name not in self.groups:
-                self.groups[group_name] = []
-
             if prog_config.numprocs > 1:
+                for field_name in ("stdout_logfile", "stderr_logfile"):
+                    logpath = getattr(prog_config, field_name)
+                    if logpath and "%(process_num)s" not in logpath:
+                        self.logger.warning(
+                            "Program '%s': %s=%s has no %%(process_num)s but numprocs=%d; "
+                            "all instances will write to the same file with interleaved output",
+                            prog_config.name,
+                            field_name,
+                            logpath,
+                            prog_config.numprocs,
+                        )
                 for i in range(prog_config.numprocs):
                     instance_name = "%s:%02d" % (prog_config.name, i)
                     p_conf = replace(
@@ -70,11 +78,25 @@ class Supervisor:
                     )
                     if instance_name not in self.processes:
                         self.processes[instance_name] = Process(p_conf, self.event_bus)
-                        self.groups[group_name].append(instance_name)
             else:
                 if prog_config.name not in self.processes:
                     self.processes[prog_config.name] = Process(prog_config, self.event_bus)
-                    self.groups[group_name].append(prog_config.name)
+
+    def _rebuild_groups(self, programs: list[ProgramConfig]) -> None:
+        """Reconcile self.groups with the given config from scratch.
+
+        Groups are derived entirely from the program configs (their ``group``
+        field and ``numprocs``), so adding, removing, renaming a group, or
+        moving a program between groups is all reflected correctly.
+        """
+        groups: dict[str, list[str]] = {}
+        for prog_config in programs:
+            group_name = prog_config.group if prog_config.group else prog_config.name
+            members = groups.setdefault(group_name, [])
+            for instance_name in self._instance_names(prog_config):
+                if instance_name not in members:
+                    members.append(instance_name)
+        self.groups = groups
 
     async def run(self) -> None:
         self.logger.info("Supervisor starting")
@@ -134,9 +156,6 @@ class Supervisor:
             await proc.stop_process()
             await proc.stop()
             del self.processes[name]
-            for group_procs in self.groups.values():
-                if name in group_procs:
-                    group_procs.remove(name)
 
         if added:
             self._create_processes(new_programs)
@@ -145,6 +164,11 @@ class Supervisor:
                     await self.processes[name].start()
 
         self.config = new_config
+
+        # Reconcile group membership with the new config. This handles added,
+        # removed, and renamed groups as well as programs that moved between
+        # groups — none of which the incremental add/remove logic covers.
+        self._rebuild_groups(new_config.programs)
 
         for name in changed:
             self.logger.warning("Program '%s' config changed; restart manually to apply", name)
@@ -193,16 +217,20 @@ class Supervisor:
             except OSError:
                 pass
             self._pidfile_fd = None
+            # Only remove the pidfile if it still contains our PID, so we never
+            # delete a file another instance created (e.g. if the path changed
+            # or was recreated by a second daemon).
             if self.config.pidfile and os.path.exists(self.config.pidfile):
                 try:
-                    os.remove(self.config.pidfile)
+                    with open(self.config.pidfile) as f:
+                        contents = f.read().strip()
+                    if contents == str(os.getpid()):
+                        os.remove(self.config.pidfile)
                 except OSError:
                     pass
 
     async def shutdown(self) -> None:
         self.logger.info("Shutting down...")
-
-        self._release_pidfile_lock()
 
         if self.rpc_server:
             await self.rpc_server.stop()
@@ -223,5 +251,11 @@ class Supervisor:
                     "Shutdown timed out after %ds, some processes may not have stopped cleanly",
                     self.config.shutdown_timeout,
                 )
+
+        # Release the pidfile lock *last* — only after all children have been
+        # stopped (or the shutdown timeout fired). Releasing earlier would let a
+        # new instance grab the pidfile/socket while our children are still
+        # alive, orphaning them.
+        self._release_pidfile_lock()
 
         self.logger.info("Shutdown complete")

@@ -232,7 +232,10 @@ def parse_config(path: str) -> SupervisorConfig:
         raise FileNotFoundError("Config file not found: %s" % path)
 
     parser = configparser.ConfigParser()
-    parser.read(path)
+    # Use read_file (not read) so an unreadable file raises a real error instead
+    # of being silently ignored.
+    with open(path) as f:
+        parser.read_file(f)
 
     sup_config = SupervisorConfig()
 
