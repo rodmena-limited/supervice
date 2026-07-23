@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+Certification release. Adds the full critical-systems audit trail and the
+v0.2.0 certification (`audit-2026-07-23.md`) to the repository, and removes an
+unreachable code path in the client. No functional changes since 0.2.0.
+
 ## 0.2.0
 
 Hardening release driven by a full critical-systems audit

@@ -19,9 +19,9 @@ class Controller:
 
     async def _read_message(self, reader: asyncio.StreamReader) -> bytes | None:
         """Read a length-prefixed message from the stream."""
+        # readexactly() returns exactly HEADER_SIZE bytes or raises
+        # IncompleteReadError; there is no empty-return case to check.
         header = await reader.readexactly(HEADER_SIZE)
-        if not header:
-            return None
 
         msg_length = struct.unpack(">I", header)[0]
 
