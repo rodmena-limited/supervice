@@ -5,13 +5,17 @@ import struct
 import sys
 from typing import Any
 
+from supervice.models import default_socket_path
+
 HEADER_SIZE = 4
 MAX_MESSAGE_SIZE = 1024 * 1024
+DEFAULT_TIMEOUT = 30.0
 
 
 class Controller:
-    def __init__(self, socket_path: str = "/tmp/supervice.sock"):
-        self.socket_path = socket_path
+    def __init__(self, socket_path: str | None = None, timeout: float = DEFAULT_TIMEOUT):
+        self.socket_path = socket_path or default_socket_path()
+        self.timeout = timeout
 
     async def _read_message(self, reader: asyncio.StreamReader) -> bytes | None:
         """Read a length-prefixed message from the stream."""
@@ -36,6 +40,19 @@ class Controller:
         await writer.drain()
 
     async def send_command(self, command: str, **kwargs: Any) -> dict[str, Any]:
+        # Bounded end-to-end: a wedged daemon must not hang the CLI (or any
+        # automation built on it) forever.
+        try:
+            return await asyncio.wait_for(
+                self._exchange(command, **kwargs), timeout=self.timeout
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                "No response from supervice within %.0fs (socket: %s)"
+                % (self.timeout, self.socket_path)
+            ) from e
+
+    async def _exchange(self, command: str, **kwargs: Any) -> dict[str, Any]:
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
 
         try:
@@ -188,8 +205,14 @@ def main() -> None:
     parser.add_argument(
         "-s",
         "--socket",
-        default="/tmp/supervice.sock",
-        help="Path to supervice Unix socket (default: /tmp/supervice.sock)",
+        default=None,
+        help="Path to supervice Unix socket (default: %s)" % default_socket_path(),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help="Seconds to wait for the daemon to respond (default: %d)" % DEFAULT_TIMEOUT,
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -224,7 +247,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    client = Controller(socket_path=args.socket)
+    client = Controller(socket_path=args.socket, timeout=args.timeout)
 
     success = False
     if args.command == "status":

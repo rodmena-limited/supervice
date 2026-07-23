@@ -64,10 +64,19 @@ healthcheck_start_period = 15
 
 ### How It Works
 
-1. Supervice runs the `healthcheck_command` as a subprocess
+1. Supervice runs the `healthcheck_command` as a subprocess — as the program's
+   configured `user` (never as the possibly-root daemon)
 2. Waits up to `healthcheck_timeout` seconds for it to complete
 3. Exit code 0 = healthy, any other code = unhealthy
 4. If the script times out, it is killed and counts as a failure
+
+### Restart Policy
+
+When a process is marked unhealthy and `autorestart` is enabled, it is killed
+and respawned **through the backoff machinery**: each consecutive
+health-triggered restart waits one second longer than the previous one, and
+after `startretries` consecutive health restarts the process is marked `FATAL`
+instead of cycling forever. A passing health check resets the counter.
 
 ### When to Use
 
@@ -78,11 +87,13 @@ healthcheck_start_period = 15
 ### Security
 
 > **Warning:** `healthcheck_command` is executed through a shell
-> (`/bin/sh -c`), so it runs **arbitrary code as the user Supervice runs as**.
-> Anyone who can write the configuration file — including a CI/CD system that
-> interpolates environment variables into it — can achieve arbitrary command
-> execution. Treat the config file as trusted input: restrict who can write it,
-> avoid interpolating untrusted values into `healthcheck_command`, and prefer
+> (`/bin/sh -c`). It runs as the program's configured `user` (or as the daemon's
+> user when no `user` is set), so a check script writable by the service user
+> cannot escalate to the daemon's privileges — but anyone who can write the
+> configuration file — including a CI/CD system that interpolates environment
+> variables into it — can still achieve arbitrary command execution. Treat the
+> config file as trusted input: restrict who can write it, avoid interpolating
+> untrusted values into `healthcheck_command`, and prefer
 > `healthcheck_type = tcp` when a simple connectivity check is sufficient.
 
 ### Example Health Check Scripts

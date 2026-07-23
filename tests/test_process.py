@@ -38,7 +38,9 @@ class TestProcessLifecycle(unittest.TestCase):
         asyncio.run(run())
 
     def test_spawn_failure_command_not_found(self) -> None:
-        """Test spawn with invalid command transitions to FATAL."""
+        """A missing command is retryable (covers binaries mid-deploy): one
+        spawn attempt ends EXITED; supervise escalates to FATAL only after
+        startretries is exhausted (covered in test_audit_regressions)."""
 
         async def run() -> None:
             self.event_bus.start()
@@ -47,7 +49,7 @@ class TestProcessLifecycle(unittest.TestCase):
 
             await process.spawn()
 
-            self.assertEqual(process.state, FATAL)
+            self.assertEqual(process.state, EXITED)
 
             await self.event_bus.stop()
 
@@ -58,7 +60,8 @@ class TestProcessLifecycle(unittest.TestCase):
 
         async def run() -> None:
             self.event_bus.start()
-            config = ProgramConfig(name="test", command="sleep 60")
+            # startsecs=0: RUNNING is reported immediately (no startup gate)
+            config = ProgramConfig(name="test", command="sleep 60", startsecs=0)
             process = Process(config, self.event_bus)
 
             # Start spawn in background
@@ -88,7 +91,7 @@ class TestProcessLifecycle(unittest.TestCase):
             self.event_bus.start()
             # Script that spawns a child process
             cmd = "sh -c 'sleep 60 & sleep 60'"
-            config = ProgramConfig(name="test", command=cmd)
+            config = ProgramConfig(name="test", command=cmd, startsecs=0)
             process = Process(config, self.event_bus)
 
             spawn_task = asyncio.create_task(process.spawn())
@@ -176,7 +179,8 @@ class TestProcessLifecycle(unittest.TestCase):
 
                 await process.spawn()
 
-                self.assertEqual(process.state, FATAL)
+                # Missing command is a retryable spawn failure -> EXITED.
+                self.assertEqual(process.state, EXITED)
 
                 # File should be closed - we can open it again without issue
                 with open(log_file, "a") as f:

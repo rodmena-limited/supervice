@@ -23,8 +23,9 @@ class HealthCheckResult:
 class HealthChecker(ABC):
     """Abstract base class for health checkers."""
 
-    def __init__(self, config: HealthCheckConfig):
+    def __init__(self, config: HealthCheckConfig, user: str | None = None):
         self.config = config
+        self.user = user
         self.logger = get_logger()
 
     @abstractmethod
@@ -75,10 +76,18 @@ class ScriptHealthChecker(HealthChecker):
         timeout = self.config.timeout
 
         try:
+            # Run the check as the program's user, never as the (possibly root)
+            # daemon: a check script writable by the service user must not be a
+            # privilege-escalation path. If the switch is not permitted the
+            # check fails visibly rather than silently running privileged.
+            kwargs: dict[str, str] = {}
+            if self.user:
+                kwargs["user"] = self.user
             proc = await asyncio.create_subprocess_shell(
                 self.config.command,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                **kwargs,  # type: ignore[arg-type]
             )
 
             try:
@@ -107,10 +116,12 @@ class ScriptHealthChecker(HealthChecker):
             return HealthCheckResult(False, "Health check script error: %s" % e)
 
 
-def create_health_checker(config: HealthCheckConfig) -> HealthChecker | None:
+def create_health_checker(
+    config: HealthCheckConfig, user: str | None = None
+) -> HealthChecker | None:
     """Factory function to create the appropriate health checker."""
     if config.type == HealthCheckType.TCP:
-        return TCPHealthChecker(config)
+        return TCPHealthChecker(config, user)
     elif config.type == HealthCheckType.SCRIPT:
-        return ScriptHealthChecker(config)
+        return ScriptHealthChecker(config, user)
     return None

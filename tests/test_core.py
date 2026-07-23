@@ -73,6 +73,10 @@ class TestRPCServer(unittest.TestCase):
         async def run():
             supervisor_mock = MagicMock()
             proc_mock = AsyncMock()
+            # RPC replies are now truthful: they inspect the state reached.
+            proc_mock.state = "STOPPED"
+            proc_mock.start_process = AsyncMock(return_value="RUNNING")
+            proc_mock.stop_process = AsyncMock(return_value="STOPPED")
             supervisor_mock.processes = {"p1": proc_mock}
             supervisor_mock.groups = {"g1": ["p1"]}
 

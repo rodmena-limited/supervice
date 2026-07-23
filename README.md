@@ -120,10 +120,10 @@ supervicectl -s /var/run/supervice.sock status
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `logfile` | `supervice.log` | Path to the daemon log file |
+| `logfile` | *(stdout)* | Daemon log file; empty logs to stdout in foreground, `supervice.log` when daemonized |
 | `loglevel` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `pidfile` | `supervice.pid` | Path to the PID/lock file |
-| `socket` | `/tmp/supervice.sock` | Unix socket path for RPC |
+| `socket` | *(runtime dir)* | RPC socket; defaults to `$XDG_RUNTIME_DIR/supervice.sock` (root: `/run/supervice.sock`, else `~/.supervice.sock`) |
 | `shutdown_timeout` | `30` | Seconds to wait for graceful shutdown |
 | `log_maxbytes` | `52428800` | Max log file size before rotation (bytes, 0 = no rotation) |
 | `log_backups` | `10` | Number of rotated log backup files to keep |
@@ -140,8 +140,11 @@ supervicectl -s /var/run/supervice.sock status
 | `startretries` | `3` | Max consecutive start attempts before entering FATAL state |
 | `stopsignal` | `TERM` | Signal to send when stopping (`TERM`, `INT`, `QUIT`, `KILL`, etc.) |
 | `stopwaitsecs` | `10` | Seconds to wait after stop signal before sending SIGKILL |
-| `stdout_logfile` | *(none)* | File for stdout (supports `%(process_num)s` substitution) |
-| `stderr_logfile` | *(none)* | File for stderr (supports `%(process_num)s` substitution) |
+| `stdout_logfile` | *(none)* | File for stdout (rotated by the daemon; supports `%(process_num)s`) |
+| `stderr_logfile` | *(none)* | File for stderr (rotated by the daemon; supports `%(process_num)s`) |
+| `stdout_logfile_maxbytes` / `stderr_logfile_maxbytes` | `50MB` | Child log rotation threshold (0 disables) |
+| `stdout_logfile_backups` / `stderr_logfile_backups` | `10` | Rotated child log backups to keep |
+| `pdeathsig` | `true` | Linux: SIGKILL the child if the supervisor dies |
 | `environment` | *(none)* | Environment variables: `KEY=VAL,KEY2="val with,comma"` |
 | `directory` | *(none)* | Working directory for the process |
 | `user` | *(none)* | Run as this user (requires root privileges) |

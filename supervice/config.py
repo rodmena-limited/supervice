@@ -1,7 +1,10 @@
 import configparser
 import os
+import shlex
 
 from supervice.models import (
+    DEFAULT_CHILD_LOG_BACKUPS,
+    DEFAULT_CHILD_LOG_MAXBYTES,
     HealthCheckConfig,
     HealthCheckType,
     ProgramConfig,
@@ -194,6 +197,18 @@ def _validate_healthcheck(hc: HealthCheckConfig, program_name: str) -> None:
             )
 
 
+def _validate_command(command: str, program_name: str) -> None:
+    """Validate that a command parses at load time, not first spawn."""
+    try:
+        args = shlex.split(command)
+    except ValueError as e:
+        raise ConfigValidationError(
+            "Program '%s': command does not parse: %s" % (program_name, e)
+        ) from e
+    if not args:
+        raise ConfigValidationError("Program '%s': command is empty" % program_name)
+
+
 def _validate_program(prog: ProgramConfig) -> None:
     """Validate a program configuration."""
     # Validate numeric bounds
@@ -201,9 +216,15 @@ def _validate_program(prog: ProgramConfig) -> None:
     _validate_positive_int(prog.startsecs, "startsecs", prog.name)
     _validate_positive_int(prog.startretries, "startretries", prog.name)
     _validate_positive_int(prog.stopwaitsecs, "stopwaitsecs", prog.name)
+    _validate_positive_int(prog.stdout_logfile_maxbytes, "stdout_logfile_maxbytes", prog.name)
+    _validate_positive_int(prog.stdout_logfile_backups, "stdout_logfile_backups", prog.name)
+    _validate_positive_int(prog.stderr_logfile_maxbytes, "stderr_logfile_maxbytes", prog.name)
+    _validate_positive_int(prog.stderr_logfile_backups, "stderr_logfile_backups", prog.name)
 
     if prog.numprocs == 0:
         raise ConfigValidationError("Program '%s': numprocs must be at least 1" % prog.name)
+
+    _validate_command(prog.command, prog.name)
 
     # Validate signal
     _validate_signal(prog.stopsignal, prog.name)
@@ -231,7 +252,10 @@ def parse_config(path: str) -> SupervisorConfig:
     if not os.path.exists(path):
         raise FileNotFoundError("Config file not found: %s" % path)
 
-    parser = configparser.ConfigParser()
+    # interpolation=None: values are taken literally. This is required so that
+    # bare '%' works in commands (e.g. date +%s) and the %(process_num)s
+    # template survives to be expanded by the supervisor itself.
+    parser = configparser.ConfigParser(interpolation=None)
     # Use read_file (not read) so an unreadable file raises a real error instead
     # of being silently ignored.
     with open(path) as f:
@@ -301,9 +325,22 @@ def parse_config(path: str) -> SupervisorConfig:
                 stopwaitsecs=sect.getint("stopwaitsecs", 10),
                 stdout_logfile=sect.get("stdout_logfile"),
                 stderr_logfile=sect.get("stderr_logfile"),
+                stdout_logfile_maxbytes=sect.getint(
+                    "stdout_logfile_maxbytes", DEFAULT_CHILD_LOG_MAXBYTES
+                ),
+                stdout_logfile_backups=sect.getint(
+                    "stdout_logfile_backups", DEFAULT_CHILD_LOG_BACKUPS
+                ),
+                stderr_logfile_maxbytes=sect.getint(
+                    "stderr_logfile_maxbytes", DEFAULT_CHILD_LOG_MAXBYTES
+                ),
+                stderr_logfile_backups=sect.getint(
+                    "stderr_logfile_backups", DEFAULT_CHILD_LOG_BACKUPS
+                ),
                 environment=_parse_env(sect.get("environment", "")),
                 directory=sect.get("directory"),
                 user=sect.get("user"),
+                pdeathsig=_parse_bool(sect.get("pdeathsig", "true")),
                 healthcheck=healthcheck,
             )
 
@@ -326,9 +363,17 @@ def parse_config(path: str) -> SupervisorConfig:
             if not programs_str:
                 continue
 
-            program_names = [p.strip() for p in programs_str.split(",")]
+            program_names = [p.strip() for p in programs_str.split(",") if p.strip()]
 
-            # Verify and update programs
+            # A group member that references no defined program is a config
+            # error, not something to silently ignore.
+            known = {prog.name for prog in sup_config.programs}
+            unknown = [p for p in program_names if p not in known]
+            if unknown:
+                raise ConfigValidationError(
+                    "Group '%s': unknown program(s): %s" % (group_name, ", ".join(unknown))
+                )
+
             for prog in sup_config.programs:
                 if prog.name in program_names:
                     prog.group = group_name

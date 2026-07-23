@@ -17,7 +17,9 @@ class TestModels(unittest.TestCase):
 
     def test_supervisor_config_defaults(self):
         sc = SupervisorConfig()
-        self.assertEqual(sc.logfile, "supervice.log")
+        # Empty logfile default: foreground logs to stdout, daemon mode falls
+        # back to supervice.log with a warning.
+        self.assertEqual(sc.logfile, "")
         self.assertEqual(sc.loglevel, "INFO")
         self.assertEqual(sc.programs, [])
 

@@ -47,10 +47,15 @@ class ProgramConfig:
     stopwaitsecs: int = 10
     stdout_logfile: str | None = None
     stderr_logfile: str | None = None
+    stdout_logfile_maxbytes: int = 52428800  # 50MB, 0 disables rotation
+    stdout_logfile_backups: int = 10
+    stderr_logfile_maxbytes: int = 52428800
+    stderr_logfile_backups: int = 10
     environment: dict[str, str] = field(default_factory=dict)
     directory: str | None = None
     user: str | None = None
     group: str | None = None
+    pdeathsig: bool = True  # Linux: SIGKILL children if the supervisor dies
     healthcheck: HealthCheckConfig = field(default_factory=HealthCheckConfig)
 ```
 
@@ -59,15 +64,21 @@ class ProgramConfig:
 ```python
 @dataclass
 class SupervisorConfig:
-    logfile: str = "supervice.log"
+    logfile: str = ""  # empty: stdout in foreground, supervice.log when daemonized
     pidfile: str = "supervice.pid"
     loglevel: str = "INFO"
-    socket_path: str = "/tmp/supervice.sock"
+    socket_path: str = field(default_factory=default_socket_path)
     shutdown_timeout: int = 30
     log_maxbytes: int = 52428800  # 50MB
     log_backups: int = 10
     programs: list[ProgramConfig] = field(default_factory=list)
 ```
+
+### `default_socket_path()`
+
+Returns the default RPC socket path: `$XDG_RUNTIME_DIR/supervice.sock` when
+available, `/run/supervice.sock` for root, otherwise `~/.supervice.sock`.
+World-writable `/tmp` is deliberately avoided (socket squatting).
 
 ## supervice.config
 
@@ -209,8 +220,11 @@ Client for communicating with the Supervice daemon over Unix socket.
 
 ```python
 class Controller:
-    def __init__(self, socket_path: str = "/tmp/supervice.sock"): ...
+    def __init__(self, socket_path: str | None = None, timeout: float = 30.0): ...
 ```
+
+`socket_path=None` uses `default_socket_path()`. Every command is bounded by
+`timeout` seconds; a wedged daemon raises `TimeoutError` instead of hanging.
 
 #### `async send_command(command: str, **kwargs) -> dict`
 
@@ -251,7 +265,7 @@ import asyncio
 from supervice.client import Controller
 
 async def check():
-    ctl = Controller("/tmp/supervice.sock")
+    ctl = Controller()  # uses default_socket_path()
     await ctl.status()
     await ctl.restart_process("webapp")
 

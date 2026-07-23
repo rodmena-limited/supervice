@@ -46,7 +46,8 @@ Performs a double-fork daemonization:
 4. Redirects stdin/stdout/stderr to `/dev/null`
 
 Logs are written to the configured log file. If no log file is configured,
-defaults to `supervice.log` in the current directory.
+foreground mode (`-n`) logs to stdout (container-friendly); daemon mode falls
+back to `supervice.log` in the current directory with a warning.
 
 ### Signal Handling
 
@@ -70,7 +71,8 @@ supervicectl [-h] [-s SOCKET] {status,start,stop,restart,startgroup,stopgroup,re
 
 | Option | Description |
 |--------|-------------|
-| `-s`, `--socket` | Unix socket path (default: `/tmp/supervice.sock`) |
+| `-s`, `--socket` | Unix socket path (default: `$XDG_RUNTIME_DIR/supervice.sock`, `/run/supervice.sock` for root, else `~/.supervice.sock` — same resolution the daemon uses) |
+| `--timeout` | Seconds to wait for a daemon response (default: 30) |
 | `-h`, `--help` | Show help message |
 
 ### Commands

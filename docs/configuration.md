@@ -22,10 +22,10 @@ Global daemon configuration.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `logfile` | string | `supervice.log` | Path to the daemon log file |
+| `logfile` | string | *(stdout)* | Daemon log file. Empty: stdout in foreground mode; daemon mode falls back to `supervice.log` |
 | `loglevel` | string | `INFO` | Logging level |
 | `pidfile` | string | `supervice.pid` | Path to PID/lock file |
-| `socket` | string | `/tmp/supervice.sock` | Unix socket path for RPC communication |
+| `socket` | string | *(runtime dir)* | Unix socket path for RPC. Default: `$XDG_RUNTIME_DIR/supervice.sock`, `/run/supervice.sock` for root, else `~/.supervice.sock`. Avoid world-writable directories like `/tmp` |
 | `shutdown_timeout` | int | `30` | Seconds to wait for graceful shutdown of all processes |
 | `log_maxbytes` | int | `52428800` | Max log file size in bytes before rotation (0 disables rotation) |
 | `log_backups` | int | `10` | Number of rotated backup log files to keep |
@@ -84,9 +84,18 @@ process identifier used in CLI commands and status output.
 | `stopwaitsecs` | int | `10` | Seconds to wait before SIGKILL |
 | `stdout_logfile` | string | *(none)* | File for stdout output |
 | `stderr_logfile` | string | *(none)* | File for stderr output |
+| `stdout_logfile_maxbytes` | int | `52428800` | Rotate stdout log at this size (bytes, 0 disables) |
+| `stdout_logfile_backups` | int | `10` | Rotated stdout backups to keep |
+| `stderr_logfile_maxbytes` | int | `52428800` | Rotate stderr log at this size (bytes, 0 disables) |
+| `stderr_logfile_backups` | int | `10` | Rotated stderr backups to keep |
 | `environment` | string | *(none)* | Environment variables |
 | `directory` | string | *(none)* | Working directory |
 | `user` | string | *(none)* | Run as this user |
+| `pdeathsig` | bool | `true` | Linux: SIGKILL the child if the supervisor dies |
+
+Child logs are captured through pipes and rotated by the daemon itself
+(`file`, `file.1` … `file.N`), so they cannot grow without bound and no
+external logrotate integration is needed.
 
 ### `command`
 
@@ -113,15 +122,30 @@ numprocs = 4
 
 Creates: `worker:00`, `worker:01`, `worker:02`, `worker:03`.
 
+`%(process_num)s` is expanded (to `00`, `01`, …) in `command`, `environment`
+values, `stdout_logfile`, and `stderr_logfile`, so each instance can get its
+own port, settings, and log files:
+
+```ini
+[program:api]
+command = python3 api.py --port 80%(process_num)s
+environment = INSTANCE=%(process_num)s
+numprocs = 2
+```
+
 ### `startsecs` and `startretries`
 
 These options work together to determine startup behavior:
 
-- If a process exits before `startsecs` seconds have elapsed, it counts as a
-  failed start attempt
+- A process stays in `STARTING` until it has run for `startsecs`; only then is
+  it reported `RUNNING` (with `startsecs = 0` it is `RUNNING` immediately)
+- If it exits before `startsecs` have elapsed — or the spawn itself fails for a
+  transient reason (fd exhaustion, log directory briefly missing) — that counts
+  as a failed start attempt and is retried with a growing backoff delay
 - After `startretries` consecutive failed starts, the process enters `FATAL`
   state and stops trying
-- If a process runs longer than `startsecs`, the retry counter resets to zero
+- Once a process reaches `RUNNING`, the retry counter resets; exits after that
+  are restarted indefinitely under `autorestart`, paced at one per second
 
 ```ini
 startsecs = 5        # must run at least 5 seconds

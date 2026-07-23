@@ -7,7 +7,7 @@ from dataclasses import replace
 from supervice.config import parse_config
 from supervice.events import EventBus
 from supervice.logger import get_logger
-from supervice.models import ProgramConfig, SupervisorConfig
+from supervice.models import HealthCheckType, ProgramConfig, SupervisorConfig
 from supervice.process import Process
 from supervice.rpc import RPCServer
 
@@ -23,6 +23,7 @@ class Supervisor:
         self.rpc_server: RPCServer | None = None
         self._pidfile_fd: int | None = None
         self._config_path: str = ""
+        self._reload_lock = asyncio.Lock()
 
     def load_config(self, path: str) -> None:
         self.logger.info("Loading config from %s", path)
@@ -39,10 +40,14 @@ class Supervisor:
         self._rebuild_groups(self.config.programs)
 
     @staticmethod
-    def _expand_logfile(path: str | None, process_num: int) -> str | None:
-        if path is None:
+    def _expand(value: str, process_num: int) -> str:
+        return value.replace("%(process_num)s", "%02d" % process_num)
+
+    @classmethod
+    def _expand_opt(cls, value: str | None, process_num: int) -> str | None:
+        if value is None:
             return None
-        return path.replace("%(process_num)s", "%02d" % process_num)
+        return cls._expand(value, process_num)
 
     @staticmethod
     def _instance_names(prog_config: ProgramConfig) -> list[str]:
@@ -50,6 +55,27 @@ class Supervisor:
         if prog_config.numprocs > 1:
             return ["%s:%02d" % (prog_config.name, i) for i in range(prog_config.numprocs)]
         return [prog_config.name]
+
+    @classmethod
+    def _instance_config(cls, prog: ProgramConfig, process_num: int) -> ProgramConfig:
+        """Build the effective per-instance config for one numprocs slot.
+
+        %(process_num)s is expanded in command, environment values, and both
+        logfile paths. This is the single source of truth for instance configs:
+        creation and change-detection must both use it, or reloads misreport.
+        """
+        if prog.numprocs > 1:
+            name = "%s:%02d" % (prog.name, process_num)
+        else:
+            name = prog.name
+        return replace(
+            prog,
+            name=name,
+            command=cls._expand(prog.command, process_num),
+            environment={k: cls._expand(v, process_num) for k, v in prog.environment.items()},
+            stdout_logfile=cls._expand_opt(prog.stdout_logfile, process_num),
+            stderr_logfile=cls._expand_opt(prog.stderr_logfile, process_num),
+        )
 
     def _create_processes(
         self,
@@ -68,19 +94,19 @@ class Supervisor:
                             logpath,
                             prog_config.numprocs,
                         )
-                for i in range(prog_config.numprocs):
-                    instance_name = "%s:%02d" % (prog_config.name, i)
-                    p_conf = replace(
-                        prog_config,
-                        name=instance_name,
-                        stdout_logfile=self._expand_logfile(prog_config.stdout_logfile, i),
-                        stderr_logfile=self._expand_logfile(prog_config.stderr_logfile, i),
+                if prog_config.healthcheck.type == HealthCheckType.TCP:
+                    self.logger.warning(
+                        "Program '%s': numprocs=%d with a TCP health check: all instances "
+                        "will probe the same port %s; use %%(process_num)s in the command "
+                        "to give each instance its own port",
+                        prog_config.name,
+                        prog_config.numprocs,
+                        prog_config.healthcheck.port,
                     )
-                    if instance_name not in self.processes:
-                        self.processes[instance_name] = Process(p_conf, self.event_bus)
-            else:
-                if prog_config.name not in self.processes:
-                    self.processes[prog_config.name] = Process(prog_config, self.event_bus)
+            for i in range(prog_config.numprocs):
+                p_conf = self._instance_config(prog_config, i)
+                if p_conf.name not in self.processes:
+                    self.processes[p_conf.name] = Process(p_conf, self.event_bus)
 
     def _rebuild_groups(self, programs: list[ProgramConfig]) -> None:
         """Reconcile self.groups with the given config from scratch.
@@ -106,23 +132,31 @@ class Supervisor:
             loop.add_signal_handler(sig, self._handle_signal, sig)
         loop.add_signal_handler(signal.SIGHUP, self._handle_sighup)
 
-        if self.config.pidfile:
-            self._acquire_pidfile_lock()
+        try:
+            if self.config.pidfile:
+                self._acquire_pidfile_lock()
 
-        self.event_bus.start()
-        start_tasks = []
-        for process in self.processes.values():
-            start_tasks.append(process.start())
+            self.event_bus.start()
 
-        if start_tasks:
-            await asyncio.gather(*start_tasks)
+            # Bind the RPC socket BEFORE spawning anything: if another instance
+            # is already alive this raises and no duplicate children are forked.
+            if self.rpc_server:
+                await self.rpc_server.start()
 
-        if self.rpc_server:
-            await self.rpc_server.start()
+            start_tasks = []
+            for process in self.processes.values():
+                start_tasks.append(process.start())
+            if start_tasks:
+                await asyncio.gather(*start_tasks)
 
-        await self._shutdown_event.wait()
-
-        await self.shutdown()
+            await self._shutdown_event.wait()
+        finally:
+            # Runs on both the normal path and startup failures, so partially
+            # started state (event bus, RPC socket, pidfile) is always undone.
+            try:
+                await self.shutdown()
+            except Exception:
+                self.logger.critical("Error during shutdown", exc_info=True)
 
     def _handle_signal(self, sig: int) -> None:
         self.logger.info("Received signal %d", sig)
@@ -132,6 +166,10 @@ class Supervisor:
         self.logger.info("Received SIGHUP, ignoring (use 'reload' command instead)")
 
     async def reload_config(self) -> dict[str, list[str]]:
+        async with self._reload_lock:
+            return await self._reload_config_locked()
+
+    async def _reload_config_locked(self) -> dict[str, list[str]]:
         self.logger.info("Reloading config from %s", self._config_path)
         new_config = parse_config(self._config_path)
 
@@ -140,11 +178,8 @@ class Supervisor:
         new_programs: list[ProgramConfig] = []
 
         for prog in new_config.programs:
-            if prog.numprocs > 1:
-                for i in range(prog.numprocs):
-                    new_names.add("%s:%02d" % (prog.name, i))
-            else:
-                new_names.add(prog.name)
+            for name in self._instance_names(prog):
+                new_names.add(name)
             new_programs.append(prog)
 
         added = new_names - old_names
@@ -163,6 +198,14 @@ class Supervisor:
                 if name in self.processes:
                     await self.processes[name].start()
 
+        # Apply changed configs to the existing Process objects so the next
+        # (manual or automatic) restart actually uses the new settings.
+        for prog in new_config.programs:
+            for i in range(prog.numprocs):
+                inst = self._instance_config(prog, i)
+                if inst.name in changed and inst.name in self.processes:
+                    self.processes[inst.name].update_config(inst)
+
         self.config = new_config
 
         # Reconcile group membership with the new config. This handles added,
@@ -171,7 +214,9 @@ class Supervisor:
         self._rebuild_groups(new_config.programs)
 
         for name in changed:
-            self.logger.warning("Program '%s' config changed; restart manually to apply", name)
+            self.logger.info(
+                "Program '%s': config updated; takes effect on next restart", name
+            )
 
         result: dict[str, list[str]] = {
             "added": sorted(added),
@@ -186,13 +231,10 @@ class Supervisor:
         if not old_proc:
             return False
         for prog in new_config.programs:
-            if prog.numprocs > 1:
-                for i in range(prog.numprocs):
-                    if "%s:%02d" % (prog.name, i) == name:
-                        new_conf = replace(prog, name=name)
-                        return old_proc.config != new_conf
-            elif prog.name == name:
-                return old_proc.config != prog
+            for i in range(prog.numprocs):
+                inst = self._instance_config(prog, i)
+                if inst.name == name:
+                    return old_proc.config != inst
         return False
 
     def _acquire_pidfile_lock(self) -> None:

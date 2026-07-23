@@ -1,14 +1,21 @@
 import asyncio
+import errno
 import json
 import os
+import stat
 import struct
+import time
 from typing import Any
 
 from supervice.logger import get_logger
+from supervice.process import ProcessStartError
 
 # Length-prefixed protocol constants
 HEADER_SIZE = 4  # 4 bytes for message length (uint32, big-endian)
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB max message size
+
+# States in which a process is considered "down" after a stop request.
+_DOWN_STATES = ("STOPPED", "EXITED", "FATAL")
 
 # Valid RPC commands
 VALID_COMMANDS = frozenset(
@@ -31,25 +38,31 @@ class RPCServer:
         self.logger = get_logger()
         self.server: asyncio.AbstractServer | None = None
 
-    async def _is_socket_alive(self) -> bool:
-        """Return True if a live instance is already listening on the socket.
+    async def _probe_socket(self) -> str:
+        """Classify an existing socket path: 'alive', 'stale', or 'unknown'.
 
-        Attempts to connect and exchange a ``status`` request. A refused/failed
-        connection means the socket is stale and safe to remove.
+        Only a definitively dead socket (nothing accepting connections) is
+        'stale'. Anything that accepts a connection but does not speak our
+        protocol — or cannot be judged — is 'unknown' and must not be removed:
+        stealing a busy instance's socket silently splits the daemons.
         """
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(self.socket_path), timeout=1.0
+                asyncio.open_unix_connection(self.socket_path), timeout=2.0
             )
-        except (OSError, asyncio.TimeoutError):
-            return False
+        except asyncio.TimeoutError:
+            return "unknown"
+        except OSError as e:
+            if e.errno in (errno.ECONNREFUSED, errno.ENOENT, errno.ENOTSOCK):
+                return "stale"
+            return "unknown"
         try:
             request = json.dumps({"command": "status"}).encode("utf-8")
             await self._write_message(writer, request)
-            data = await asyncio.wait_for(self._read_message(reader), timeout=1.0)
-            return data is not None
+            data = await asyncio.wait_for(self._read_message(reader), timeout=2.0)
+            return "alive" if data is not None else "unknown"
         except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
-            return False
+            return "unknown"
         finally:
             writer.close()
             try:
@@ -58,15 +71,40 @@ class RPCServer:
                 pass
 
     async def start(self) -> None:
+        sock_dir = os.path.dirname(self.socket_path) or "."
+        try:
+            dir_mode = os.stat(sock_dir).st_mode
+            if dir_mode & stat.S_IWOTH:
+                self.logger.warning(
+                    "Socket directory %s is world-writable; another local user could "
+                    "pre-create %s to block startup or impersonate the daemon. "
+                    "Configure 'socket' to a private directory.",
+                    sock_dir,
+                    self.socket_path,
+                )
+        except OSError:
+            pass
+
         if os.path.exists(self.socket_path):
-            # Never blindly unlink: an existing socket may belong to a live
-            # instance (e.g. when the pidfile lock is disabled). Only remove it
-            # if nothing responds on it.
-            if await self._is_socket_alive():
+            probe = await self._probe_socket()
+            if probe == "alive":
                 msg = "Another supervice instance is already listening on %s" % self.socket_path
                 self.logger.critical(msg)
                 raise RuntimeError(msg)
-            os.unlink(self.socket_path)
+            if probe == "unknown":
+                msg = (
+                    "Socket %s exists but could not be verified as stale; refusing to "
+                    "replace it. Remove it manually if no supervice instance is running."
+                    % self.socket_path
+                )
+                self.logger.critical(msg)
+                raise RuntimeError(msg)
+            try:
+                os.unlink(self.socket_path)
+            except OSError as e:
+                msg = "Cannot remove stale socket %s: %s" % (self.socket_path, e)
+                self.logger.critical(msg)
+                raise RuntimeError(msg) from e
 
         # Security: Set umask to create socket with restrictive permissions atomically
         # This prevents the race condition where socket is world-readable briefly
@@ -87,10 +125,7 @@ class RPCServer:
 
     async def _read_message(self, reader: asyncio.StreamReader) -> bytes | None:
         """Read a length-prefixed message from the stream."""
-        # Read the 4-byte header
         header = await reader.readexactly(HEADER_SIZE)
-        if not header:
-            return None
 
         msg_length = struct.unpack(">I", header)[0]
 
@@ -181,12 +216,37 @@ class RPCServer:
             writer.close()
             await writer.wait_closed()
 
+    async def _start_one(self, name: str) -> dict[str, Any]:
+        """Start one process and report the true outcome."""
+        proc = self.supervisor.processes[name]
+        if proc.state == "RUNNING":
+            return {"status": "ok", "message": "%s is already running" % name}
+        try:
+            final_state = await proc.start_process()
+        except ProcessStartError as e:
+            return {"status": "error", "message": str(e)}
+        if final_state == "RUNNING":
+            return {"status": "ok", "message": "Started %s" % name}
+        return {
+            "status": "error",
+            "message": "%s did not reach RUNNING (state: %s)" % (name, final_state),
+        }
+
+    async def _stop_one(self, name: str) -> dict[str, Any]:
+        """Stop one process and report the true outcome."""
+        proc = self.supervisor.processes[name]
+        final_state = await proc.stop_process()
+        if final_state in _DOWN_STATES:
+            return {"status": "ok", "message": "Stopped %s" % name}
+        return {
+            "status": "error",
+            "message": "%s did not stop (state: %s)" % (name, final_state),
+        }
+
     async def process_request(self, request: dict[str, Any]) -> dict[str, Any]:
         command = request.get("command")
 
         if command == "status":
-            import time
-
             now = time.time()
             processes = []
             for name, proc in self.supervisor.processes.items():
@@ -197,7 +257,7 @@ class RPCServer:
                     "pid": proc.process.pid if is_alive else None,
                 }
                 if proc.started_at is not None and is_alive:
-                    proc_info["uptime"] = int(now - proc.started_at)
+                    proc_info["uptime"] = max(0, int(now - proc.started_at))
                 if proc.is_healthy is not None:
                     proc_info["healthy"] = proc.is_healthy
                 processes.append(proc_info)
@@ -206,18 +266,13 @@ class RPCServer:
         elif command == "stop":
             name = request.get("name")
             if name and name in self.supervisor.processes:
-                await self.supervisor.processes[name].stop_process()
-                return {"status": "ok", "message": "Stopped %s" % name}
+                return await self._stop_one(name)
             return {"status": "error", "message": "Process not found"}
 
         elif command == "start":
             name = request.get("name")
             if name and name in self.supervisor.processes:
-                proc = self.supervisor.processes[name]
-                if proc.state == "RUNNING":
-                    return {"status": "ok", "message": "%s is already running" % name}
-                await proc.start_process()
-                return {"status": "ok", "message": "Started %s" % name}
+                return await self._start_one(name)
             return {"status": "error", "message": "Process not found"}
 
         elif command == "restart":
@@ -228,32 +283,58 @@ class RPCServer:
                 if force:
                     await proc.force_kill()
                 else:
-                    await proc.stop_process()
-                await proc.start_process()
-                return {"status": "ok", "message": "Restarted %s" % name}
+                    stop_result = await self._stop_one(name)
+                    if stop_result["status"] != "ok":
+                        return stop_result
+                start_result = await self._start_one(name)
+                if start_result["status"] == "ok":
+                    return {"status": "ok", "message": "Restarted %s" % name}
+                return start_result
             return {"status": "error", "message": "Process not found"}
 
         elif command == "stopgroup":
             group = request.get("name")
             if group and group in self.supervisor.groups:
-                tasks = []
-                for proc_name in self.supervisor.groups[group]:
-                    if proc_name in self.supervisor.processes:
-                        tasks.append(self.supervisor.processes[proc_name].stop_process())
-                if tasks:
-                    await asyncio.gather(*tasks)
+                names = [
+                    n for n in self.supervisor.groups[group] if n in self.supervisor.processes
+                ]
+                results = await asyncio.gather(
+                    *(self._stop_one(n) for n in names), return_exceptions=True
+                )
+                failed = [
+                    n
+                    for n, r in zip(names, results, strict=True)
+                    if isinstance(r, BaseException) or r.get("status") != "ok"
+                ]
+                if failed:
+                    return {
+                        "status": "error",
+                        "message": "Stopped group %s, but failed for: %s"
+                        % (group, ", ".join(failed)),
+                    }
                 return {"status": "ok", "message": "Stopped group %s" % group}
             return {"status": "error", "message": "Group not found"}
 
         elif command == "startgroup":
             group = request.get("name")
             if group and group in self.supervisor.groups:
-                tasks = []
-                for proc_name in self.supervisor.groups[group]:
-                    if proc_name in self.supervisor.processes:
-                        tasks.append(self.supervisor.processes[proc_name].start_process())
-                if tasks:
-                    await asyncio.gather(*tasks)
+                names = [
+                    n for n in self.supervisor.groups[group] if n in self.supervisor.processes
+                ]
+                results = await asyncio.gather(
+                    *(self._start_one(n) for n in names), return_exceptions=True
+                )
+                failed = [
+                    n
+                    for n, r in zip(names, results, strict=True)
+                    if isinstance(r, BaseException) or r.get("status") != "ok"
+                ]
+                if failed:
+                    return {
+                        "status": "error",
+                        "message": "Started group %s, but failed for: %s"
+                        % (group, ", ".join(failed)),
+                    }
                 return {"status": "ok", "message": "Started group %s" % group}
             return {"status": "error", "message": "Group not found"}
 

@@ -118,9 +118,13 @@ Each `Process` instance manages a single OS process through a state machine:
 
 ### Concurrency Safety
 
-State transitions are protected by an `asyncio.Lock` (`_state_lock`) to prevent
-race conditions between the supervision loop, RPC commands, and health check
-tasks.
+Individual state transitions are serialized by an `asyncio.Lock`
+(`_state_lock`); transition *sequences* are kept coherent by ownership rules:
+the supervision loop is the sole owner of respawn/backoff decisions, `wait()`
+defers to an in-progress stop (STOPPING/STOPPED) instead of overwriting it, and
+`spawn()` re-checks for a stop request after the fork so a stop that lands
+mid-spawn kills the child instead of being lost. RPC `start`/`stop` wait for
+the state to settle and report the state actually reached.
 
 ## Supervisor (core.py)
 
@@ -251,16 +255,20 @@ process group. This ensures that `os.killpg()` kills the entire process tree
 
 ### Orphan Prevention (Linux)
 
-On Linux, `prctl(PR_SET_PDEATHSIG, SIGKILL)` is set in the `preexec_fn` to
-ensure child processes are killed if the parent dies unexpectedly.
+On Linux, `prctl(PR_SET_PDEATHSIG, SIGKILL)` is set in a minimal post-fork hook
+so child processes are killed if the supervisor dies unexpectedly. libc is
+loaded once in the parent at import time — the hook itself performs no imports
+or dlopen (both are unsafe after fork in a threaded parent). Note the tradeoff:
+a supervisor crash immediately SIGKILLs every managed service. Set
+`pdeathsig = false` per program to let children survive a supervisor crash
+(they are then orphaned, as with supervisord).
 
 ### User Switching
 
-When `user` is configured, the `preexec_fn` callback:
-
-1. Calls `os.initgroups()` to set supplementary groups
-2. Calls `os.setgid()` to set the group ID
-3. Calls `os.setuid()` to set the user ID
-
-Failures exit with code 126 (`EXIT_CODE_USER_SWITCH_FAILED`), which the parent
-process interprets as a `FATAL` state.
+When `user` is configured, the user is resolved with `pwd.getpwnam()` in the
+*parent*, and `uid`/`gid`/supplementary groups are passed to
+`asyncio.create_subprocess_exec(user=..., group=..., extra_groups=...)`, which
+performs the switch inside the C child path of `subprocess` — safe in a
+threaded parent, unlike a Python `preexec_fn`. An unknown user or a denied
+switch is reported as a spawn error in the parent and drives the process to
+`FATAL` (permanent errors are not retried).

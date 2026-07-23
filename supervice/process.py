@@ -1,11 +1,13 @@
 import asyncio
 import ctypes
 import os
+import pwd
 import shlex
+import shutil
 import signal
 import sys
+import time
 from asyncio import subprocess
-from typing import IO, Any
 
 from supervice.events import Event, EventBus, EventType
 from supervice.health import HealthChecker, create_health_checker
@@ -22,15 +24,105 @@ EXITED = "EXITED"
 FATAL = "FATAL"
 UNHEALTHY = "UNHEALTHY"  # Process is running but health checks failing
 
-# Exit code used by the child when preexec setup fails. This is only used for a
-# human-readable exit status in logs; the parent detects preexec failure via a
-# dedicated status pipe (see spawn/_read_preexec_status), NOT via the exit code.
-# Overloading exit codes is unreliable because a real program can legitimately
-# exit with any code (e.g. 126/127 mean "cannot exec"/"not found" under a shell).
-EXIT_CODE_USER_SWITCH_FAILED = 126  # User switching failed
+# Upper bound on the delay between restart attempts.
+MAX_BACKOFF_DELAY = 30
 
-# Single-byte markers written to the preexec status pipe on failure.
-_PREEXEC_USER_SWITCH_FAILED = b"U"
+# Loaded once in the parent at import time. The preexec hook below runs in the
+# forked child before exec, where dlopen/imports are unsafe if any other thread
+# holds allocator or loader locks — so nothing may be loaded there.
+PR_SET_PDEATHSIG = 1
+_LIBC: ctypes.CDLL | None = None
+if sys.platform == "linux":
+    try:
+        _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        _LIBC = None
+
+_STATE_EVENTS = {
+    STARTING: EventType.PROCESS_STATE_STARTING,
+    RUNNING: EventType.PROCESS_STATE_RUNNING,
+    BACKOFF: EventType.PROCESS_STATE_BACKOFF,
+    STOPPING: EventType.PROCESS_STATE_STOPPING,
+    EXITED: EventType.PROCESS_STATE_EXITED,
+    STOPPED: EventType.PROCESS_STATE_STOPPED,
+    FATAL: EventType.PROCESS_STATE_FATAL,
+    UNHEALTHY: EventType.PROCESS_STATE_UNHEALTHY,
+}
+
+
+class ProcessStartError(Exception):
+    """An explicit start request ended in FATAL."""
+
+
+def _pdeathsig_preexec() -> None:
+    """Post-fork/pre-exec hook: SIGKILL the child when the parent dies.
+
+    Only ever touches the pre-loaded libc handle — no imports, no dlopen, no
+    allocation-heavy work is safe here.
+    """
+    if _LIBC is not None:
+        try:
+            _LIBC.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL))
+        except Exception:
+            pass
+
+
+class _ChildLogWriter:
+    """Size-rotated log sink for one child output stream.
+
+    Writes are ordinary buffered file I/O performed on the event loop — the
+    same tradeoff the daemon's own RotatingFileHandler makes.
+    """
+
+    def __init__(self, path: str, maxbytes: int, backups: int) -> None:
+        self.path = path
+        self.maxbytes = maxbytes
+        self.backups = backups
+        self._file = open(path, "ab")
+        try:
+            self._size = os.fstat(self._file.fileno()).st_size
+        except OSError:
+            self._size = 0
+
+    def write(self, chunk: bytes) -> None:
+        if self.maxbytes <= 0:
+            self._file.write(chunk)
+            self._file.flush()
+            self._size += len(chunk)
+            return
+        # Split oversized chunks so the live file never exceeds maxbytes.
+        while chunk:
+            room = self.maxbytes - self._size
+            if room <= 0:
+                self._rotate()
+                room = self.maxbytes
+            part = chunk[:room]
+            self._file.write(part)
+            self._file.flush()
+            self._size += len(part)
+            chunk = chunk[len(part):]
+
+    def _rotate(self) -> None:
+        self._file.close()
+        if self.backups > 0:
+            for i in range(self.backups - 1, 0, -1):
+                src = "%s.%d" % (self.path, i)
+                if os.path.exists(src):
+                    os.replace(src, "%s.%d" % (self.path, i + 1))
+            os.replace(self.path, "%s.1" % self.path)
+        else:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        self._file = open(self.path, "ab")
+        self._size = 0
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except OSError:
+            pass
 
 
 class Process:
@@ -44,55 +136,65 @@ class Process:
         self._task: asyncio.Task[None] | None = None
         self.event_bus = event_bus
         self.should_run = config.autostart
-        # Lock for state transitions to prevent race conditions
+        # Serializes individual state transitions; transition *sequences* are
+        # kept coherent by the ownership rules documented on each method.
         self._state_lock = asyncio.Lock()
-        # Event to signal state changes (for start_process waiting)
+        # Set on every transition; waiters clear before re-checking state so no
+        # edge is lost. Never cleared by the setter.
         self._state_changed = asyncio.Event()
         # Health check state
-        self._health_checker: HealthChecker | None = create_health_checker(config.healthcheck)
+        self._health_checker: HealthChecker | None = create_health_checker(
+            config.healthcheck, user=config.user
+        )
         self._health_task: asyncio.Task[None] | None = None
         self._health_failures = 0
-        self.is_healthy: bool | None = None  # None = not checked yet, True/False = check result
-        self._spawn_time: float = 0.0
+        # Consecutive health-triggered restarts; reset by a passing check or an
+        # explicit start request. Bounds health-restart churn (FATAL when it
+        # exceeds startretries).
+        self._health_restarts = 0
+        self.is_healthy: bool | None = None  # None = not checked yet
         self.started_at: float | None = None
+        # True once the current/last run survived the startsecs gate. Runs that
+        # never reached RUNNING count against startretries; runs that did are
+        # restarted indefinitely (with 1s pacing) under autorestart.
+        self._reached_running = False
+        self._log_tasks: list[asyncio.Task[None]] = []
+
+    # ------------------------------------------------------------------ state
+
+    def _set_state_locked(self, new_state: str) -> None:
+        """Perform a transition. Caller must hold _state_lock."""
+        old_state = self.state
+        self.state = new_state
+        self._state_changed.set()
+        if new_state == old_state:
+            return  # idempotent transition; wake waiters but publish nothing
+        event_type = _STATE_EVENTS.get(new_state)
+        if event_type:
+            payload = {
+                "processname": self.config.name,
+                "groupname": self.config.group or self.config.name,
+                "from_state": old_state,
+                "pid": self.process.pid if self.process else None,
+            }
+            self.event_bus.publish(Event(type=event_type, payload=payload))
 
     async def _change_state(self, new_state: str) -> None:
         async with self._state_lock:
-            old_state = self.state
-            self.state = new_state
+            self._set_state_locked(new_state)
 
-            # Signal that state has changed (for waiters in start_process).
-            # Only set here; waiters clear it before re-checking state so no
-            # edge is lost (see start_process). Do NOT clear inside the setter.
-            self._state_changed.set()
+    def update_config(self, new_config: ProgramConfig) -> None:
+        """Swap in a new configuration; takes full effect at the next spawn.
 
-            # Map state string to EventType
-            event_type = None
-            if new_state == STARTING:
-                event_type = EventType.PROCESS_STATE_STARTING
-            elif new_state == RUNNING:
-                event_type = EventType.PROCESS_STATE_RUNNING
-            elif new_state == BACKOFF:
-                event_type = EventType.PROCESS_STATE_BACKOFF
-            elif new_state == STOPPING:
-                event_type = EventType.PROCESS_STATE_STOPPING
-            elif new_state == EXITED:
-                event_type = EventType.PROCESS_STATE_EXITED
-            elif new_state == STOPPED:
-                event_type = EventType.PROCESS_STATE_STOPPED
-            elif new_state == FATAL:
-                event_type = EventType.PROCESS_STATE_FATAL
-            elif new_state == UNHEALTHY:
-                event_type = EventType.PROCESS_STATE_UNHEALTHY
+        stopsignal/stopwaitsecs apply immediately; a running health-check task
+        keeps its captured settings until the process is restarted.
+        """
+        self.config = new_config
+        self._health_checker = create_health_checker(
+            new_config.healthcheck, user=new_config.user
+        )
 
-            if event_type:
-                payload = {
-                    "processname": self.config.name,
-                    "groupname": self.config.group or self.config.name,
-                    "from_state": old_state,
-                    "pid": self.process.pid if self.process else None,
-                }
-                self.event_bus.publish(Event(type=event_type, payload=payload))
+    # ------------------------------------------------- system lifecycle (core)
 
     async def start(self) -> None:
         """Start the supervision task (system lifecycle)."""
@@ -108,7 +210,7 @@ class Process:
         await self.kill()
         if self._task:
             try:
-                await asyncio.wait_for(self._task, timeout=self.config.stopwaitsecs + 2)
+                await asyncio.wait_for(self._task, timeout=self.config.stopwaitsecs + 5)
             except asyncio.TimeoutError:
                 self._task.cancel()
                 try:
@@ -116,48 +218,93 @@ class Process:
                 except asyncio.CancelledError:
                     pass
 
-    async def start_process(self) -> None:
-        """Request to start the managed process (RPC)."""
+    # ----------------------------------------------------------- RPC commands
+
+    async def start_process(self) -> str:
+        """Request a start (RPC). Returns the state that was reached.
+
+        Raises ProcessStartError only if *this* start attempt ends FATAL — a
+        FATAL left over from an earlier run is cleared, not reported as a new
+        failure.
+        """
         async with self._state_lock:
             if self.state == RUNNING:
-                return
+                return RUNNING
             self.should_run = True
-            self.backoff = 0  # Reset backoff on manual start
+            self.backoff = 0
+            self._health_restarts = 0
+            # Clear terminal/waiting states left over from a previous run so
+            # they are not mistaken for this request's outcome, and so an
+            # explicit start skips any pending backoff delay.
+            if self.state in (FATAL, EXITED, BACKOFF):
+                self._set_state_locked(STOPPED)
 
-        # Wait for state transition using event-based waiting (not polling).
-        # Clear the event *before* re-checking state so we never miss a
-        # transition: if the state is already terminal we return immediately;
-        # otherwise any subsequent _change_state() set() will wake the wait().
-        deadline = asyncio.get_event_loop().time() + 5.0  # 5 second timeout
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(5.0, self.config.startsecs + 5.0)
+        while True:
             self._state_changed.clear()
             if self.state == RUNNING:
-                return
+                return RUNNING
             if self.state == FATAL:
-                raise Exception("Spawn failed")
-            # Wait for state change event with remaining timeout
-            remaining = deadline - asyncio.get_event_loop().time()
+                raise ProcessStartError(
+                    "%s failed to start (state: FATAL)" % self.config.name
+                )
+            remaining = deadline - loop.time()
             if remaining <= 0:
-                break
+                return self.state
             try:
                 await asyncio.wait_for(self._state_changed.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                break
-        # If we timed out, it might still be STARTING or BACKOFF
+                return self.state
 
-    async def stop_process(self) -> None:
-        """Request to stop the managed process (RPC)."""
+    async def stop_process(self) -> str:
+        """Request a stop (RPC). Returns the settled state.
+
+        STOPPED/EXITED mean the process is down. STOPPING means it could not be
+        killed (unkillable, e.g. uninterruptible I/O) — callers must not treat
+        that as success.
+        """
         async with self._state_lock:
             self.should_run = False
         await self.kill()
 
+        # A process waiting in BACKOFF has no child to kill; the stop simply
+        # cancels the pending retry, which must be reflected as STOPPED.
+        async with self._state_lock:
+            if not self.should_run and self.state == BACKOFF:
+                self._set_state_locked(STOPPED)
+
+        # If a spawn was in flight when the stop landed, kill() had nothing to
+        # signal yet; spawn's own stop-recheck will kill the child and settle
+        # the state. Wait for that instead of reporting success early.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.config.stopwaitsecs + 7.0
+        while True:
+            self._state_changed.clear()
+            if self.state in (STOPPED, EXITED, FATAL):
+                return self.state
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return self.state
+            try:
+                await asyncio.wait_for(self._state_changed.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return self.state
+
+    # ------------------------------------------------------------ supervision
+
     async def supervise(self) -> None:
-        """Main supervision loop."""
+        """Main supervision loop. Sole owner of respawn/backoff decisions."""
         while not self.stop_event.is_set():
-            if self.should_run:
-                if self.state in (STOPPED, EXITED, FATAL, BACKOFF):
+            try:
+                # Normalize: a cancelled retry (stop while in BACKOFF) settles
+                # to STOPPED no matter which path cancelled it.
+                if not self.should_run and self.state == BACKOFF:
+                    await self._change_state(STOPPED)
+
+                if self.should_run and self.state in (STOPPED, EXITED, FATAL, BACKOFF):
                     if self.state == BACKOFF:
-                        delay = self.config.startsecs + self.backoff
+                        delay = min(max(self.backoff, 1), MAX_BACKOFF_DELAY)
                         self.logger.info("Backoff %s: waiting %ds", self.config.name, delay)
                         try:
                             await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
@@ -169,16 +316,44 @@ class Process:
                         await self.spawn()
 
                         if self.state == EXITED:
-                            if self.config.autorestart:
-                                await self._change_state(BACKOFF)
-                                self.backoff += 1
-                                if self.backoff > self.config.startretries:
-                                    await self._change_state(FATAL)
-                                    self.should_run = False
+                            if self.should_run and self.config.autorestart:
+                                if self._reached_running:
+                                    # A real run ended: restart indefinitely,
+                                    # paced at 1s so a short-lived program
+                                    # cannot become a tight respawn loop.
+                                    self.backoff = 1
+                                    await self._change_state(BACKOFF)
+                                else:
+                                    self.backoff += 1
+                                    if self.backoff > self.config.startretries:
+                                        self.logger.error(
+                                            "%s: giving up after %d failed start attempts",
+                                            self.config.name,
+                                            self.backoff,
+                                        )
+                                        await self._change_state(FATAL)
+                                        self.should_run = False
+                                    else:
+                                        await self._change_state(BACKOFF)
                             else:
                                 self.should_run = False
                         elif self.state == FATAL:
                             self.should_run = False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Safety net: supervision must never die silently. Mark the
+                # process FATAL (visible + alertable) instead of freezing it.
+                self.logger.critical(
+                    "Supervision error for %s; marking FATAL",
+                    self.config.name,
+                    exc_info=True,
+                )
+                self.should_run = False
+                try:
+                    await self._change_state(FATAL)
+                except Exception:
+                    pass
 
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=0.1)
@@ -191,199 +366,196 @@ class Process:
     async def spawn(self) -> None:
         await self._change_state(STARTING)
         self.logger.info("Spawning %s", self.config.name)
+        self._reached_running = False
 
-        stdout_dest: int | IO[Any] = asyncio.subprocess.DEVNULL
-        stderr_dest: int | IO[Any] = asyncio.subprocess.DEVNULL
-        stdout_file: IO[Any] | None = None
-        stderr_file: IO[Any] | None = None
-
-        # Status pipe: preexec writes a marker byte on failure. On success it
-        # writes nothing and the write end (CLOEXEC) auto-closes at exec time,
-        # giving the parent EOF. This lets us distinguish a genuine preexec
-        # failure from a real program that happens to exit with code 126/127.
-        err_read: int | None = None
-        err_write: int | None = None
+        stdout_writer: _ChildLogWriter | None = None
+        stderr_writer: _ChildLogWriter | None = None
+        self._log_tasks = []
 
         try:
-            # Simple file logging
-            if self.config.stdout_logfile:
-                stdout_file = open(self.config.stdout_logfile, "a")
-                stdout_dest = stdout_file
-
-            if self.config.stderr_logfile:
-                stderr_file = open(self.config.stderr_logfile, "a")
-                stderr_dest = stderr_file
-
-            # Parse command
             args = shlex.split(self.config.command)
+            if not args:
+                raise ValueError("empty command")
             program = args[0]
-            program_args = args[1:]
-
-            if not os.path.isabs(program):
-                import shutil
-
-                executable = shutil.which(program)
+            if os.path.isabs(program):
+                executable = program
+            else:
+                executable = shutil.which(program) or ""
                 if not executable:
                     raise FileNotFoundError("Command not found: %s" % program)
-            else:
-                executable = program
 
-            # Store user for preexec closure (avoid late binding issues)
-            target_user = self.config.user
+            # Resolve the target user in the parent and let subprocess perform
+            # setuid/setgid/setgroups in its C child path. Doing this via a
+            # Python preexec_fn is unsafe in a threaded parent (import/allocator
+            # deadlocks after fork).
+            popen_user: dict[str, object] = {}
+            if self.config.user:
+                try:
+                    pw = pwd.getpwnam(self.config.user)
+                except KeyError:
+                    self.logger.error(
+                        "%s failed: user '%s' not found", self.config.name, self.config.user
+                    )
+                    await self._change_state(FATAL)
+                    return
+                popen_user["user"] = pw.pw_uid
+                popen_user["group"] = pw.pw_gid
+                if os.geteuid() == 0:
+                    popen_user["extra_groups"] = os.getgrouplist(
+                        self.config.user, pw.pw_gid
+                    )
 
-            err_read, err_write = os.pipe()
-            # Capture the write fd in a local so the closure does not depend on
-            # the outer variable (which the parent sets to None after closing).
-            status_fd = err_write
+            stdout_dest: int = subprocess.DEVNULL
+            stderr_dest: int = subprocess.DEVNULL
+            if self.config.stdout_logfile:
+                stdout_writer = _ChildLogWriter(
+                    self.config.stdout_logfile,
+                    self.config.stdout_logfile_maxbytes,
+                    self.config.stdout_logfile_backups,
+                )
+                stdout_dest = subprocess.PIPE
+            if self.config.stderr_logfile:
+                stderr_writer = _ChildLogWriter(
+                    self.config.stderr_logfile,
+                    self.config.stderr_logfile_maxbytes,
+                    self.config.stderr_logfile_backups,
+                )
+                stderr_dest = subprocess.PIPE
 
-            def preexec() -> None:
-                # User switching - must happen first before any other setup
-                if target_user:
-                    import pwd
-
-                    try:
-                        pw_record = pwd.getpwnam(target_user)
-                        # Set supplementary groups first (requires root)
-                        try:
-                            os.initgroups(target_user, pw_record.pw_gid)
-                        except PermissionError:
-                            # Not running as root, just set primary group
-                            pass
-                        os.setgid(pw_record.pw_gid)
-                        os.setuid(pw_record.pw_uid)
-                    except KeyError:
-                        # User not found - signal parent then exit before exec
-                        os.write(status_fd, _PREEXEC_USER_SWITCH_FAILED)
-                        sys.stderr.write("supervice: user '%s' not found\n" % target_user)
-                        sys.stderr.flush()
-                        os._exit(EXIT_CODE_USER_SWITCH_FAILED)
-                    except PermissionError:
-                        os.write(status_fd, _PREEXEC_USER_SWITCH_FAILED)
-                        msg = "supervice: permission denied switching to user '%s'\n"
-                        sys.stderr.write(msg % target_user)
-                        sys.stderr.flush()
-                        os._exit(EXIT_CODE_USER_SWITCH_FAILED)
-                    except OSError as e:
-                        os.write(status_fd, _PREEXEC_USER_SWITCH_FAILED)
-                        msg = "supervice: failed to switch to user '%s': %s\n"
-                        sys.stderr.write(msg % (target_user, e))
-                        sys.stderr.flush()
-                        os._exit(EXIT_CODE_USER_SWITCH_FAILED)
-
-                # Linux: auto-kill child when parent dies
-                if sys.platform == "linux":
-                    try:
-                        pr_set_pdeathsig = 1
-                        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-                        libc.prctl(pr_set_pdeathsig, signal.SIGKILL)
-                    except (OSError, AttributeError):
-                        pass
+            preexec = None
+            if self.config.pdeathsig and _LIBC is not None:
+                preexec = _pdeathsig_preexec
 
             self.process = await asyncio.create_subprocess_exec(
                 executable,
-                *program_args,
+                *args[1:],
                 stdout=stdout_dest,
                 stderr=stderr_dest,
                 env={**os.environ, **self.config.environment},
                 cwd=self.config.directory,
                 preexec_fn=preexec,
                 start_new_session=True,
+                **popen_user,  # type: ignore[arg-type]
             )
 
-            # Close the parent's copy of the write end so the read below can
-            # observe EOF once the child execs (or exits after signalling).
-            os.close(err_write)
-            err_write = None
-
-            preexec_status = await self._read_preexec_status(err_read)
-            if preexec_status:
-                # Child failed during preexec (e.g. user switch). Reap it and
-                # go FATAL — this is a genuine setup failure, not a program exit.
-                self.logger.error(
-                    "%s failed: could not switch to user '%s' (preexec setup error)",
-                    self.config.name,
-                    self.config.user,
+            if stdout_writer is not None and self.process.stdout is not None:
+                self._log_tasks.append(
+                    asyncio.create_task(self._pump_stream(self.process.stdout, stdout_writer))
                 )
-                try:
-                    await self.process.wait()
-                except Exception:
-                    pass
-                await self._change_state(FATAL)
+                stdout_writer = None  # the pump owns closing it now
+            if stderr_writer is not None and self.process.stderr is not None:
+                self._log_tasks.append(
+                    asyncio.create_task(self._pump_stream(self.process.stderr, stderr_writer))
+                )
+                stderr_writer = None
+
+            # A stop request may have landed between the supervise loop's check
+            # and the fork; honour it now instead of leaving the child running.
+            if not self.should_run or self.stop_event.is_set():
+                self.logger.info(
+                    "%s: stop requested during spawn; killing child", self.config.name
+                )
+                await self.kill()
                 return
 
+            # startsecs gate: only report RUNNING once the process survived the
+            # configured startup window. An exit inside the window is a failed
+            # start attempt and counts against startretries.
+            if self.config.startsecs > 0:
+                exited_early = True
+                try:
+                    await asyncio.wait_for(
+                        self.process.wait(), timeout=self.config.startsecs
+                    )
+                except asyncio.TimeoutError:
+                    exited_early = False
+                if exited_early:
+                    self.logger.warning(
+                        "%s exited before startsecs (%ds): start attempt failed",
+                        self.config.name,
+                        self.config.startsecs,
+                    )
+                    await self.wait()
+                    return
+
+            self.backoff = 0
+            self._reached_running = True
             await self._change_state(RUNNING)
             self.logger.info("Started %s (pid %d)", self.config.name, self.process.pid)
-
-            import time as _time
-
-            self._spawn_time = asyncio.get_event_loop().time()
-            self.started_at = _time.time()
+            self.started_at = time.time()
 
             await self._start_health_checks()
-
             await self.wait()
 
         except Exception as e:
-            self.logger.error("Failed to spawn %s: %s", self.config.name, e)
-            await self._change_state(FATAL)
+            # ValueError: unparseable command/arguments; PermissionError: user
+            # switch or exec permission denied. Both are permanent — anything
+            # else (EMFILE/EAGAIN, log dir briefly missing, binary mid-deploy)
+            # is retried under the normal backoff/startretries policy.
+            if isinstance(e, (ValueError, PermissionError)):
+                self.logger.error("%s failed permanently: %s", self.config.name, e)
+                await self._change_state(FATAL)
+            else:
+                self.logger.error(
+                    "Failed to spawn %s (will retry): %s", self.config.name, e
+                )
+                await self._change_state(EXITED)
         finally:
-            # Always close pipe fds and file handles to prevent leaks
-            if err_write is not None:
-                os.close(err_write)
-            if err_read is not None:
-                os.close(err_read)
-            if stdout_file is not None:
-                stdout_file.close()
-            if stderr_file is not None:
-                stderr_file.close()
+            for writer in (stdout_writer, stderr_writer):
+                if writer is not None:
+                    writer.close()
+            if self._log_tasks:
+                # Drain child output. EOF arrives promptly once the child (and
+                # any pipe-holding descendants) are gone; if a detached
+                # descendant keeps the pipe open, leave the pump running — it
+                # closes the file itself at EOF.
+                await asyncio.wait(self._log_tasks, timeout=2)
 
-    async def _read_preexec_status(self, fd: int) -> bytes:
-        """Read the preexec status pipe until EOF.
-
-        Returns a non-empty bytes marker if the child signalled a preexec
-        failure, or b"" if preexec succeeded (write end closed at exec time).
-        The read runs in a thread so it never blocks the event loop; because the
-        write end is CLOEXEC, EOF arrives the moment the child execs, so this
-        returns promptly even for long-running processes.
-        """
-
-        def _read_all() -> bytes:
-            chunks = []
-            try:
-                while True:
-                    chunk = os.read(fd, 64)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-            except OSError:
-                pass
-            return b"".join(chunks)
-
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _read_all)
+    async def _pump_stream(
+        self, stream: asyncio.StreamReader, writer: _ChildLogWriter
+    ) -> None:
+        try:
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.error("%s: log writer error: %s", self.config.name, e)
+        finally:
+            writer.close()
 
     async def wait(self) -> None:
+        """Wait for the child to exit and record the outcome.
+
+        If a stop is in progress (STOPPING/STOPPED), the exit is expected and
+        this only completes the STOPPING -> STOPPED sequence; otherwise the
+        exit is recorded as EXITED for the supervise loop to act on.
+        """
         if not self.process:
             return
 
         return_code = await self.process.wait()
-
         self.logger.info("%s exited with code %d", self.config.name, return_code)
 
-        runtime = asyncio.get_event_loop().time() - self._spawn_time
-        if runtime >= self.config.startsecs:
-            self.backoff = 0
+        async with self._state_lock:
+            if self.state in (STOPPING, STOPPED):
+                self._set_state_locked(STOPPED)
+                return
+            self._set_state_locked(EXITED)
 
-        await self._change_state(EXITED)
+    # ---------------------------------------------------------- health checks
 
     async def _run_health_checks(self) -> None:
-        """Run health checks periodically while process is running."""
-        if not self._health_checker:
+        """Run health checks periodically while the process is running."""
+        checker = self._health_checker
+        if not checker:
             return
 
         hc_config = self.config.healthcheck
 
-        # Wait for start period before beginning health checks
         if hc_config.start_period > 0:
             self.logger.debug(
                 "%s: waiting %ds before starting health checks",
@@ -395,7 +567,7 @@ class Process:
         running_states = (RUNNING, UNHEALTHY)
         while self.state in running_states and self.process and self.process.returncode is None:
             try:
-                result = await self._health_checker.check()
+                result = await checker.check()
 
                 if result.healthy:
                     if self._health_failures > 0:
@@ -405,13 +577,12 @@ class Process:
                             self._health_failures,
                         )
                     self._health_failures = 0
+                    self._health_restarts = 0
                     self.is_healthy = True
 
-                    # Transition back to RUNNING if we were UNHEALTHY
                     if self.state == UNHEALTHY:
                         await self._change_state(RUNNING)
 
-                    # Emit health check passed event
                     self.event_bus.publish(
                         Event(
                             type=EventType.HEALTHCHECK_PASSED,
@@ -432,7 +603,6 @@ class Process:
                         result.message,
                     )
 
-                    # Emit health check failed event
                     self.event_bus.publish(
                         Event(
                             type=EventType.HEALTHCHECK_FAILED,
@@ -456,42 +626,75 @@ class Process:
                         if self.state == RUNNING:
                             await self._change_state(UNHEALTHY)
 
-                        # Auto-restart on health failure if autorestart is enabled
                         if self.config.autorestart:
-                            self.logger.info(
-                                "%s: restarting due to health check failures", self.config.name
-                            )
-                            await self.kill()
+                            self._health_restarts += 1
                             self._health_failures = 0
-                            return  # Exit health check loop, process will be restarted
+                            if self._health_restarts > self.config.startretries:
+                                # Bounded: persistent unhealthiness must not
+                                # become an endless kill/respawn cycle.
+                                self.logger.error(
+                                    "%s: still unhealthy after %d health-triggered "
+                                    "restarts; giving up (FATAL)",
+                                    self.config.name,
+                                    self._health_restarts - 1,
+                                )
+                                async with self._state_lock:
+                                    self.should_run = False
+                                await self.kill()
+                                await self._change_state(FATAL)
+                            else:
+                                self.logger.info(
+                                    "%s: restarting due to health check failures "
+                                    "(restart %d/%d)",
+                                    self.config.name,
+                                    self._health_restarts,
+                                    self.config.startretries,
+                                )
+                                await self.kill()
+                                # Route the respawn through BACKOFF so repeated
+                                # health restarts are paced, not immediate.
+                                self.backoff = self._health_restarts
+                                await self._change_state(BACKOFF)
+                            return
 
             except asyncio.CancelledError:
-                return
+                raise
             except Exception as e:
                 self.logger.error("%s: health check error: %s", self.config.name, e)
 
-            # Wait for next check interval
             await asyncio.sleep(hc_config.interval)
 
     async def _start_health_checks(self) -> None:
-        """Start the health check task if health checks are configured."""
         if self._health_checker and self.config.healthcheck.type != HealthCheckType.NONE:
             self._health_failures = 0
             self.is_healthy = None
             self._health_task = asyncio.create_task(self._run_health_checks())
 
     async def _stop_health_checks(self) -> None:
-        """Stop the health check task."""
-        if self._health_task and not self._health_task.done():
-            self._health_task.cancel()
+        task = self._health_task
+        self._health_task = None
+        # Never cancel-and-await the *current* task: kill() is legitimately
+        # called from inside the health task itself (health-triggered restart).
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
             try:
-                await self._health_task
+                await task
             except asyncio.CancelledError:
                 pass
-        self._health_task = None
+
+    # ---------------------------------------------------------------- killing
+
+    def _signal_group(self, sig: int) -> None:
+        if not self.process:
+            return
+        try:
+            pgid = os.getpgid(self.process.pid)
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            pass
 
     async def force_kill(self) -> None:
-        """Immediately SIGKILL the process without graceful shutdown."""
+        """Immediately SIGKILL the process group without graceful shutdown."""
         await self._stop_health_checks()
         self.started_at = None
         async with self._state_lock:
@@ -501,15 +704,15 @@ class Process:
             return
 
         await self._change_state(STOPPING)
-        try:
-            pgid = os.getpgid(self.process.pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
+        self._signal_group(signal.SIGKILL)
         try:
             await asyncio.wait_for(self.process.wait(), timeout=2)
         except asyncio.TimeoutError:
-            pass
+            self.logger.critical(
+                "%s: process group did not die after SIGKILL; leaving state STOPPING",
+                self.config.name,
+            )
+            return
         await self._change_state(STOPPED)
 
     async def kill(self) -> None:
@@ -523,26 +726,24 @@ class Process:
         self.logger.info("Stopping %s", self.config.name)
 
         sig = getattr(signal, "SIG%s" % self.config.stopsignal, signal.SIGTERM)
-
-        # Kill entire process group, not just main process
-        try:
-            pgid = os.getpgid(self.process.pid)
-            os.killpg(pgid, sig)
-        except (ProcessLookupError, OSError):
-            pass
+        self._signal_group(sig)
 
         try:
             await asyncio.wait_for(self.process.wait(), timeout=self.config.stopwaitsecs)
         except asyncio.TimeoutError:
             self.logger.warning("%s did not stop, killing process group", self.config.name)
-            try:
-                pgid = os.getpgid(self.process.pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+            self._signal_group(signal.SIGKILL)
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=2)
             except asyncio.TimeoutError:
-                pass
+                # Unkillable (e.g. uninterruptible D-state). Claiming STOPPED
+                # here would let a duplicate instance be started; stay STOPPING
+                # until the exit is actually observed (wait() finishes the
+                # sequence whenever the process finally dies).
+                self.logger.critical(
+                    "%s: process group did not die after SIGKILL; leaving state STOPPING",
+                    self.config.name,
+                )
+                return
 
         await self._change_state(STOPPED)
