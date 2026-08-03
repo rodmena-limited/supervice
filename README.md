@@ -122,7 +122,7 @@ supervicectl -s /var/run/supervice.sock status
 |--------|---------|-------------|
 | `logfile` | *(stdout)* | Daemon log file; empty logs to stdout in foreground, `supervice.log` when daemonized |
 | `loglevel` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
-| `pidfile` | `supervice.pid` | Path to the PID/lock file |
+| `pidfile` | `supervice.pid` | Path to the PID/lock file; set to `none` (or empty) to disable |
 | `socket` | *(runtime dir)* | RPC socket; defaults to `$XDG_RUNTIME_DIR/supervice.sock` (root: `/run/supervice.sock`, else `~/.supervice.sock`) |
 | `shutdown_timeout` | `30` | Seconds to wait for graceful shutdown |
 | `log_maxbytes` | `52428800` | Max log file size before rotation (bytes, 0 = no rotation) |
@@ -144,8 +144,9 @@ supervicectl -s /var/run/supervice.sock status
 | `stderr_logfile` | *(none)* | File for stderr (rotated by the daemon; supports `%(process_num)s`) |
 | `stdout_logfile_maxbytes` / `stderr_logfile_maxbytes` | `50MB` | Child log rotation threshold (0 disables) |
 | `stdout_logfile_backups` / `stderr_logfile_backups` | `10` | Rotated child log backups to keep |
-| `pdeathsig` | `true` | Linux: SIGKILL the child if the supervisor dies |
+| `pdeathsig` | `true` | Linux/FreeBSD: SIGKILL the child if the supervisor dies |
 | `environment` | *(none)* | Environment variables: `KEY=VAL,KEY2="val with,comma"` |
+| `env_file` | *(none)* | Comma-separated `KEY=VALUE` secrets files (`#` comments, quotes stripped); read as the supervisor before the privilege drop. Later files win; `environment` overrides `env_file` |
 | `directory` | *(none)* | Working directory for the process |
 | `user` | *(none)* | Run as this user (requires root privileges) |
 
@@ -229,6 +230,94 @@ BACKOFF ──┘                    │                     EXITED
                     │supervice│
                     │  ctl    │
                     └─────────┘
+```
+
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| Linux | **First-class** — full feature set, including `pdeathsig` via `prctl(2)` |
+| FreeBSD | **Supported** (15.x, 13.x) — all features, including `pdeathsig` via `procctl(2)`; see the FreeBSD notes below |
+| macOS | Supported for supervision, **without `pdeathsig`** — no kernel equivalent exists; supervice logs a warning if you request it |
+
+Field notes from the first production FreeBSD deployment live in
+[`PORTABILITY-FREEBSD.md`](PORTABILITY-FREEBSD.md).
+
+### FreeBSD: rc.d integration
+
+Run the supervisor itself as root from `rc.d` with **no** `${name}_user` and
+**no** `daemon -u` — FreeBSD's `rc.subr` wraps the whole command in `su -m`
+when `${name}_user` is set, so combining it with `daemon -u <user>` runs
+`setuid` twice and fails with `EPERM` (and `daemon -f` swallows the error).
+Let supervice drop privileges per program with its `user =` directive
+instead.
+
+A worked `/usr/local/etc/rc.d/supervice` unit (adapted from production):
+
+```sh
+#!/bin/sh
+# PROVIDE: supervice
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="supervice"
+rcvar="supervice_enable"
+
+load_rc_config $name
+
+command="/usr/local/bin/supervice"
+command_args="-c /usr/local/etc/supervice.ini"
+
+run_rc_command "$1"
+```
+
+```ini
+; /usr/local/etc/supervice.ini
+[supervice]
+logfile = /var/log/supervice/supervice.log
+; daemon(8) is NOT used with -p here; let supervice own its pidfile.
+; If an outer supervisor already owns it, use: pidfile = none
+pidfile  = /var/run/supervice/supervice.pid
+socket   = /var/run/supervice/supervice.sock
+
+[program:api]
+command = /usr/local/bin/myapp
+directory = /usr/local/myapp
+user = myapp
+startsecs = 3
+startretries = 3
+stopsignal = TERM
+stopwaitsecs = 10
+healthcheck_type = tcp
+healthcheck_port = 8080
+```
+
+Notes for FreeBSD operators:
+
+- If something else (e.g. `daemon(8) -p`) already writes the pidfile, set
+  `pidfile = none` — `daemon(8)` writes it as root before dropping privileges,
+  so a second writer fails with `EPERM`/`EACCES`.
+- If you run supervice under `daemon(8)`, start it with **`-r`** (restart on
+  death) and **`-P`** (pidfile holds daemon's *own* pid, not the child's):
+  pointing the pidfile at the child means `service stop` kills supervice and
+  daemon immediately restarts it.
+- The pidfile and socket parent directories must exist and be writable before
+  `supervice` starts; config load now fails with a clear message otherwise.
+- Export `HOME` if your program reads client certificates from
+  `$HOME/.postgresql` or similar (asyncpg does; a wrapper script can set it).
+
+### macOS
+
+macOS has no kernel pdeathsig equivalent. `pdeathsig = true` is accepted but
+inactive, and supervice logs a warning at config load. If orphan reaping is
+essential there, a launcher can reap before exec'ing the supervisor — anything
+alive at start is by definition an orphan:
+
+```sh
+pkill -u myuser -f 'myapp' || true
+exec supervice -c /etc/supervice.ini -n
 ```
 
 ## Documentation

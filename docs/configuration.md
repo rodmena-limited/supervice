@@ -24,7 +24,7 @@ Global daemon configuration.
 |--------|------|---------|-------------|
 | `logfile` | string | *(stdout)* | Daemon log file. Empty: stdout in foreground mode; daemon mode falls back to `supervice.log` |
 | `loglevel` | string | `INFO` | Logging level |
-| `pidfile` | string | `supervice.pid` | Path to PID/lock file |
+| `pidfile` | string | `supervice.pid` | Path to PID/lock file; `none` (or empty) disables it |
 | `socket` | string | *(runtime dir)* | Unix socket path for RPC. Default: `$XDG_RUNTIME_DIR/supervice.sock`, `/run/supervice.sock` for root, else `~/.supervice.sock`. Avoid world-writable directories like `/tmp` |
 | `shutdown_timeout` | int | `30` | Seconds to wait for graceful shutdown of all processes |
 | `log_maxbytes` | int | `52428800` | Max log file size in bytes before rotation (0 disables rotation) |
@@ -89,9 +89,10 @@ process identifier used in CLI commands and status output.
 | `stderr_logfile_maxbytes` | int | `52428800` | Rotate stderr log at this size (bytes, 0 disables) |
 | `stderr_logfile_backups` | int | `10` | Rotated stderr backups to keep |
 | `environment` | string | *(none)* | Environment variables |
+| `env_file` | string | *(none)* | Comma-separated `KEY=VALUE` secrets files; later files win, `environment` overrides |
 | `directory` | string | *(none)* | Working directory |
 | `user` | string | *(none)* | Run as this user |
-| `pdeathsig` | bool | `true` | Linux: SIGKILL the child if the supervisor dies |
+| `pdeathsig` | bool | `true` | Linux/FreeBSD: SIGKILL the child if the supervisor dies |
 
 Child logs are captured through pipes and rotated by the daemon itself
 (`file`, `file.1` … `file.N`), so they cannot grow without bound and no
@@ -202,6 +203,30 @@ environment = PATH="/usr/local/bin:/usr/bin"
 ```
 
 Both single and double quotes are supported for values.
+
+### `env_file`
+
+Load environment variables from one or more `KEY=VALUE` files (blank lines
+and `#` comments are skipped, surrounding quotes on values are stripped).
+Multiple files are comma-separated; later files override earlier ones, and
+explicit `environment` values override `env_file` values:
+
+```ini
+env_file = /opt/myapp/etc/secrets.env, /opt/myapp/etc/overrides.env
+environment = LOG_LEVEL=info
+```
+
+The files are read by the supervisor **before** the privilege drop, so a
+`0600 root:root` secrets file can be delivered to a child running as an
+unprivileged user. A missing or unreadable file is a hard error at config
+load, not a silent empty environment.
+
+### `pdeathsig`
+
+On Linux and FreeBSD the child is sent `SIGKILL` when the supervisor dies,
+preventing orphans. On platforms without an equivalent (macOS) the directive
+is inactive and a warning is logged at config load.
+
 
 ### `user`
 
