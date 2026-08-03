@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.0
+
+Portability release driven by `PORTABILITY-FREEBSD.md` — field notes from
+migrating TokenGate to a native FreeBSD 15.1 host. Adds first-class FreeBSD
+support, closes the silent-feature-evaporation gap, and ships a real CI
+pipeline.
+
+### Added
+
+- **`pdeathsig` now works on FreeBSD** via `procctl(PROC_PDEATHSIG_CTL)` — the
+  supervisor's death now SIGKILLs children there too, matching Linux
+  (`prctl(PR_SET_PDEATHSIG)`).
+- **Warning for inactive directives.** If a program requests `pdeathsig` on a
+  platform that cannot honour it (e.g. macOS), supervice logs a warning at
+  config load naming the directive and platform instead of failing silently.
+- **`env_file` directive** (`[program:*]`). Points at `KEY=VALUE` secrets files
+  (`#` comments and blank lines skipped, quotes stripped). Multiple
+  comma-separated files are supported with later files winning; explicit
+  `environment` values override `env_file`. Files are read as the supervisor
+  before the privilege drop, so a `0600 root:root` secrets file can be
+  delivered to an unprivileged child. A missing/unreadable file is a hard
+  config-load error.
+- **`pidfile = none`** (or empty) disables the pidfile lock — the correct
+  setting when something else (e.g. FreeBSD `daemon(8)`) already supervises
+  the supervisor.
+- **Config-load validation of the pidfile and socket parent directories** —
+  a missing/non-writable directory now fails at load with a clear message
+  instead of crashing after daemonize.
+- **`--version`** on both `supervice` and `supervicectl` (exit 0).
+- **Per-spawn INFO line** with the resolved command, working directory, and
+  uid, so first-run diagnosis on a new platform does not require guessing.
+- **GitHub Actions CI** — ruff, mypy `--strict`, and the full pytest suite on
+  Python 3.10–3.13 for every push and pull request.
+
+### Documentation
+
+- README platform matrix (Linux first-class; FreeBSD supported; macOS without
+  `pdeathsig`) and a worked FreeBSD `rc.d` example that avoids the
+  `daemon(8)` / `${name}_user` double-setuid trap.
+- `PORTABILITY-FREEBSD.md` added to the repository as the source field notes.
+
 ## 0.2.1
 
 Certification release. Adds the full critical-systems audit trail and the
