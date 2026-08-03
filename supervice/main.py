@@ -3,6 +3,7 @@ import asyncio
 import os
 import sys
 
+from supervice import __version__
 from supervice.core import Supervisor
 from supervice.logger import setup_logger
 
@@ -31,6 +32,11 @@ def _daemonize() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Supervice: A modern process supervisor")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%(prog)s " + __version__,
+    )
     parser.add_argument(
         "-c",
         "--configuration",

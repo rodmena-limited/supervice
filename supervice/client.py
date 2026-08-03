@@ -5,6 +5,7 @@ import struct
 import sys
 from typing import Any
 
+from supervice import __version__
 from supervice.models import default_socket_path
 
 HEADER_SIZE = 4
@@ -201,6 +202,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="supervicectl",
         description="Supervice process control client",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%(prog)s " + __version__,
     )
     parser.add_argument(
         "-s",

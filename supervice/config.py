@@ -106,6 +106,31 @@ def _parse_env(value: str) -> dict[str, str]:
     return env
 
 
+def _parse_env_file_list(value: str) -> list[str]:
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+def _parse_env_file(path: str) -> dict[str, str]:
+    """Parse a KEY=VALUE secrets file: blank lines and # comments are skipped."""
+    env: dict[str, str] = {}
+    with open(path) as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, val = line.partition("=")
+            key = key.strip()
+            if not sep or not key:
+                raise ConfigValidationError(
+                    "%s:%d: malformed env line (expected KEY=VALUE)" % (path, lineno)
+                )
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            env[key] = val
+    return env
+
+
 def _validate_signal(sig_name: str, program_name: str) -> None:
     """Validate that a signal name is valid."""
     sig_upper = sig_name.upper()
@@ -243,6 +268,17 @@ def _validate_program(prog: ProgramConfig) -> None:
     if prog.stderr_logfile:
         _validate_logfile_path(prog.stderr_logfile, prog.name)
 
+    # Validate env_file paths if specified
+    for path in prog.env_file:
+        if not os.path.exists(path):
+            raise ConfigValidationError(
+                "Program '%s': env_file '%s' does not exist" % (prog.name, path)
+            )
+        if not os.access(path, os.R_OK):
+            raise ConfigValidationError(
+                "Program '%s': env_file '%s' is not readable" % (prog.name, path)
+            )
+
     # Validate health check if configured
     if prog.healthcheck.type != HealthCheckType.NONE:
         _validate_healthcheck(prog.healthcheck, prog.name)
@@ -267,6 +303,8 @@ def parse_config(path: str) -> SupervisorConfig:
         sect = parser["supervice"]
         sup_config.logfile = sect.get("logfile", sup_config.logfile)
         sup_config.pidfile = sect.get("pidfile", sup_config.pidfile)
+        if sup_config.pidfile.strip().lower() == "none":
+            sup_config.pidfile = ""
         sup_config.loglevel = sect.get("loglevel", sup_config.loglevel)
         sup_config.socket_path = sect.get("socket", sup_config.socket_path)
         sup_config.shutdown_timeout = sect.getint("shutdown_timeout", sup_config.shutdown_timeout)
@@ -288,6 +326,29 @@ def parse_config(path: str) -> SupervisorConfig:
             raise ConfigValidationError("log_maxbytes must be non-negative")
         if sup_config.log_backups < 0:
             raise ConfigValidationError("log_backups must be non-negative")
+
+        # Fail at load, not at spawn, when the pidfile/socket cannot be
+        # created: a daemon that dies right after "Starting" is worse than a
+        # config that refuses to load.
+        if sup_config.pidfile:
+            pid_parent = os.path.dirname(os.path.abspath(sup_config.pidfile)) or "."
+            if not os.path.isdir(pid_parent):
+                raise ConfigValidationError(
+                    "pidfile directory '%s' does not exist" % pid_parent
+                )
+            if not os.access(pid_parent, os.W_OK):
+                raise ConfigValidationError(
+                    "pidfile directory '%s' is not writable" % pid_parent
+                )
+        socket_parent = os.path.dirname(os.path.abspath(sup_config.socket_path)) or "."
+        if not os.path.isdir(socket_parent):
+            raise ConfigValidationError(
+                "socket directory '%s' does not exist" % socket_parent
+            )
+        if not os.access(socket_parent, os.W_OK):
+            raise ConfigValidationError(
+                "socket directory '%s' is not writable" % socket_parent
+            )
 
     for section in parser.sections():
         if section.startswith("program:"):
@@ -337,6 +398,7 @@ def parse_config(path: str) -> SupervisorConfig:
                 stderr_logfile_backups=sect.getint(
                     "stderr_logfile_backups", DEFAULT_CHILD_LOG_BACKUPS
                 ),
+                env_file=_parse_env_file_list(sect.get("env_file", "")),
                 environment=_parse_env(sect.get("environment", "")),
                 directory=sect.get("directory"),
                 user=sect.get("user"),
@@ -349,6 +411,16 @@ def parse_config(path: str) -> SupervisorConfig:
 
             # Validate the program configuration
             _validate_program(prog)
+
+            # env_file files are read here, as the supervisor and before any
+            # privilege drop, so a 0600 root-owned secrets file can be
+            # delivered to an unprivileged child. Later files override earlier
+            # ones; explicit environment values override env_file.
+            file_env: dict[str, str] = {}
+            for path in prog.env_file:
+                file_env.update(_parse_env_file(path))
+            file_env.update(prog.environment)
+            prog.environment = file_env
 
             sup_config.programs.append(prog)
 

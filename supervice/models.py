@@ -62,6 +62,7 @@ class ProgramConfig:
     stderr_logfile_maxbytes: int = DEFAULT_CHILD_LOG_MAXBYTES
     stderr_logfile_backups: int = DEFAULT_CHILD_LOG_BACKUPS
     environment: dict[str, str] = field(default_factory=dict)
+    env_file: list[str] = field(default_factory=list)
     directory: str | None = None
     user: str | None = None
     group: str | None = None
