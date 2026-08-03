@@ -30,13 +30,32 @@ MAX_BACKOFF_DELAY = 30
 # Loaded once in the parent at import time. The preexec hook below runs in the
 # forked child before exec, where dlopen/imports are unsafe if any other thread
 # holds allocator or loader locks — so nothing may be loaded there.
-PR_SET_PDEATHSIG = 1
+PR_SET_PDEATHSIG = 1  # Linux prctl(2)
+PROC_PDEATHSIG_CTL = 11  # FreeBSD sys/procctl.h
+P_PID = 0  # FreeBSD procctl(2): apply to the calling process
 _LIBC: ctypes.CDLL | None = None
 if sys.platform == "linux":
     try:
         _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
     except OSError:
         _LIBC = None
+elif sys.platform.startswith("freebsd"):
+    try:
+        _LIBC = ctypes.CDLL("libc.so.7", use_errno=True)
+        # id_t is 32-bit on FreeBSD; the value passed is always 0 (self), so
+        # explicit argtypes keep the call honest on every supported arch.
+        _LIBC.procctl.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        )
+    except (AttributeError, OSError):
+        _LIBC = None
+
+
+def pdeathsig_supported() -> bool:
+    return _LIBC is not None
 
 _STATE_EVENTS = {
     STARTING: EventType.PROCESS_STATE_STARTING,
@@ -60,11 +79,16 @@ def _pdeathsig_preexec() -> None:
     Only ever touches the pre-loaded libc handle — no imports, no dlopen, no
     allocation-heavy work is safe here.
     """
-    if _LIBC is not None:
-        try:
+    if _LIBC is None:
+        return
+    try:
+        if sys.platform == "linux":
             _LIBC.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL))
-        except Exception:
-            pass
+        elif sys.platform.startswith("freebsd"):
+            sig = ctypes.c_int(int(signal.SIGKILL))
+            _LIBC.procctl(P_PID, 0, PROC_PDEATHSIG_CTL, ctypes.byref(sig))
+    except Exception:
+        pass
 
 
 class _ChildLogWriter:
@@ -365,7 +389,6 @@ class Process:
 
     async def spawn(self) -> None:
         await self._change_state(STARTING)
-        self.logger.info("Spawning %s", self.config.name)
         self._reached_running = False
 
         stdout_writer: _ChildLogWriter | None = None
@@ -407,6 +430,13 @@ class Process:
 
             stdout_dest: int = subprocess.DEVNULL
             stderr_dest: int = subprocess.DEVNULL
+            self.logger.info(
+                "Spawning %s: %s (cwd=%s, uid=%s)",
+                self.config.name,
+                " ".join(args),
+                self.config.directory or os.getcwd(),
+                popen_user.get("user") if popen_user else os.geteuid(),
+            )
             if self.config.stdout_logfile:
                 stdout_writer = _ChildLogWriter(
                     self.config.stdout_logfile,

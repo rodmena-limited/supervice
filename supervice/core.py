@@ -2,13 +2,14 @@ import asyncio
 import fcntl
 import os
 import signal
+import sys
 from dataclasses import replace
 
 from supervice.config import parse_config
 from supervice.events import EventBus
 from supervice.logger import get_logger
 from supervice.models import HealthCheckType, ProgramConfig, SupervisorConfig
-from supervice.process import Process
+from supervice.process import Process, pdeathsig_supported
 from supervice.rpc import RPCServer
 
 
@@ -82,6 +83,13 @@ class Supervisor:
         programs: list[ProgramConfig],
     ) -> None:
         for prog_config in programs:
+            if prog_config.pdeathsig and not pdeathsig_supported():
+                self.logger.warning(
+                    "Program '%s': pdeathsig requested but unsupported on %s; "
+                    "children will survive an abrupt supervisor kill",
+                    prog_config.name,
+                    sys.platform,
+                )
             if prog_config.numprocs > 1:
                 for field_name in ("stdout_logfile", "stderr_logfile"):
                     logpath = getattr(prog_config, field_name)
