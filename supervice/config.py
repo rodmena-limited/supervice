@@ -10,6 +10,7 @@ from supervice.models import (
     ProgramConfig,
     SupervisorConfig,
 )
+from supervice.reconcile import RECONCILE_CHOICES
 
 # Valid signal names (without SIG prefix)
 VALID_SIGNALS = frozenset(
@@ -57,6 +58,21 @@ class ConfigValidationError(ValueError):
 
 def _parse_bool(value: str) -> bool:
     return value.lower() in ("true", "1", "yes", "on")
+
+
+def _parse_reconcile(program: str, value: str) -> str:
+    """Validate the reconcile policy at load, not at the point it would act.
+
+    A typo here would otherwise be discovered only during a startup after a
+    crash -- the one moment the setting matters and nobody is watching.
+    """
+    choice = value.strip().lower()
+    if choice not in RECONCILE_CHOICES:
+        raise ConfigValidationError(
+            "Program '%s': invalid reconcile '%s' (expected one of: %s)"
+            % (program, value, ", ".join(RECONCILE_CHOICES))
+        )
+    return choice
 
 
 def _parse_env(value: str) -> dict[str, str]:
@@ -307,6 +323,7 @@ def parse_config(path: str) -> SupervisorConfig:
             sup_config.pidfile = ""
         sup_config.loglevel = sect.get("loglevel", sup_config.loglevel)
         sup_config.socket_path = sect.get("socket", sup_config.socket_path)
+        sup_config.state_file = sect.get("state_file", sup_config.state_file)
         sup_config.shutdown_timeout = sect.getint("shutdown_timeout", sup_config.shutdown_timeout)
         sup_config.log_maxbytes = sect.getint("log_maxbytes", sup_config.log_maxbytes)
         sup_config.log_backups = sect.getint("log_backups", sup_config.log_backups)
@@ -403,6 +420,7 @@ def parse_config(path: str) -> SupervisorConfig:
                 directory=sect.get("directory"),
                 user=sect.get("user"),
                 pdeathsig=_parse_bool(sect.get("pdeathsig", "true")),
+                reconcile=_parse_reconcile(name, sect.get("reconcile", "auto")),
                 healthcheck=healthcheck,
             )
 

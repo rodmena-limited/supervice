@@ -93,6 +93,7 @@ process identifier used in CLI commands and status output.
 | `directory` | string | *(none)* | Working directory |
 | `user` | string | *(none)* | Run as this user |
 | `pdeathsig` | bool | `true` | Linux/FreeBSD: SIGKILL the **direct child** if the supervisor dies — see below |
+| `reconcile` | string | `auto` | What to do with an orphan of a previous supervisor found at startup: `auto`, `kill`, `warn`, `off` |
 
 Child logs are captured through pipes and rotated by the daemon itself
 (`file`, `file.1` … `file.N`), so they cannot grow without bound and no
@@ -167,6 +168,46 @@ silent child and keeps the chatty false-positive case beside it.
 **Turning it off.** `pdeathsig = false` is a deliberate opt-out: children then
 survive a supervisor crash. Choose it when riding out a supervisor restart
 matters more than never orphaning.
+
+(reconcile)=
+
+### `reconcile` — cleaning up after a crashed supervisor
+
+`pdeathsig` cannot cover everything: it does not exist on macOS, and it never
+reaches grandchildren. So a supervisor killed abruptly can leave processes
+running — and the damage is not the orphan, it is what the **next start** does.
+With no memory of what it spawned, the supervisor sees nothing running and
+starts a second copy alongside the first.
+
+At startup, before spawning anything, supervice checks the children it recorded
+last time and acts on the ones still alive.
+
+| Value | Behaviour |
+|---|---|
+| `auto` *(default)* | Kill the orphan if that program had `pdeathsig = true`; if it had `pdeathsig = false`, leave it and warn that duplicates are being created |
+| `kill` | Always kill the orphan's process group |
+| `warn` | Never kill; log that the orphan is still running |
+| `off` | Do nothing |
+
+It kills by **process group**, so it reaches the whole subtree — including the
+grandchildren `pdeathsig` structurally cannot.
+
+**Identity, not pid.** A record is `{name, pid, pgid, start-token}`. Before
+signalling anything, supervice checks that the pid is still the *same process*
+it recorded. If the start token differs the pid was recycled onto something
+else, and supervice leaves it alone. **If the identity cannot be read at all, it
+also leaves it alone** — every uncertain case declines to act, because the cost
+of a miss is one surviving orphan and the cost of a false positive is killing
+somebody else's process.
+
+**State location.** Recorded beside the pidfile (`.<name>.state.json`), or set
+`state_file` in `[supervice]`. It is deliberately per-supervisor rather than a
+single shared path: several supervice daemons can run concurrently with
+different configs, and a shared store would have one of them reconcile — and
+kill — another's children.
+
+This replaces the `pkill -f` launcher workaround previously suggested for macOS,
+which matched on a command string rather than on identity.
 
 ### `command`
 

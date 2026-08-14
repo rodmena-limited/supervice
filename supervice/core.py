@@ -6,7 +6,7 @@ import sys
 from dataclasses import replace
 
 from supervice.config import parse_config
-from supervice.events import EventBus
+from supervice.events import Event, EventBus, EventType
 from supervice.logger import get_logger
 from supervice.models import HealthCheckType, ProgramConfig, SupervisorConfig
 from supervice.process import (
@@ -14,6 +14,13 @@ from supervice.process import (
     pdeathsig_functional,
     pdeathsig_supported,
     setuid_binary,
+)
+from supervice.reconcile import (
+    ChildRecord,
+    StateStore,
+    decide,
+    kill_group,
+    process_start_token,
 )
 from supervice.rpc import RPCServer
 
@@ -30,6 +37,7 @@ class Supervisor:
         self._pidfile_fd: int | None = None
         self._config_path: str = ""
         self._reload_lock = asyncio.Lock()
+        self.state_store: StateStore | None = None
 
     def load_config(self, path: str) -> None:
         self.logger.info("Loading config from %s", path)
@@ -38,6 +46,9 @@ class Supervisor:
             self.config = parse_config(path)
             # Initialize RPC server with configured socket path
             self.rpc_server = RPCServer(self.config.socket_path, self)
+            self.state_store = StateStore(
+                self.config.state_file or StateStore.default_path(self.config.pidfile)
+            )
         except Exception as e:
             self.logger.critical("Failed to load config: %s", e)
             raise
@@ -182,6 +193,26 @@ class Supervisor:
             if self.rpc_server:
                 await self.rpc_server.start()
 
+            # Only now: the pidfile lock and the RPC bind above have both
+            # succeeded, so no other supervisor is alive for this config and
+            # anything still recorded belongs to a dead instance. Running this
+            # earlier could kill a live sibling's children.
+            self._reconcile_orphans()
+
+            # Record on state changes rather than once after startup:
+            # Process.start() only creates the supervise task and returns
+            # before any child has been spawned, so a one-shot snapshot here
+            # would persist an empty list and disarm the next reconciliation
+            # entirely -- silently, since an empty state file looks exactly
+            # like a clean shutdown.
+            for event_type in (
+                EventType.PROCESS_STATE_RUNNING,
+                EventType.PROCESS_STATE_EXITED,
+                EventType.PROCESS_STATE_STOPPED,
+                EventType.PROCESS_STATE_FATAL,
+            ):
+                self.event_bus.subscribe(event_type, self._on_child_state_change)
+
             start_tasks = []
             for process in self.processes.values():
                 start_tasks.append(process.start())
@@ -196,6 +227,99 @@ class Supervisor:
                 await self.shutdown()
             except Exception:
                 self.logger.critical("Error during shutdown", exc_info=True)
+
+    def _reconcile_orphans(self) -> None:
+        """Deal with children a previous supervisor instance left running.
+
+        Never raises: a failure here must not stop the supervisor starting.
+        Every uncertain case declines to signal -- see reconcile.decide().
+        """
+        if self.state_store is None:
+            return
+        try:
+            records = self.state_store.load()
+        except Exception:
+            self.logger.warning("Could not read reconciliation state; skipping", exc_info=True)
+            return
+
+        killed = 0
+        for record in records:
+            try:
+                verdict = decide(record)
+            except Exception:
+                self.logger.warning(
+                    "Program '%s': reconciliation check failed for pid %d; leaving it alone",
+                    record.name,
+                    record.pid,
+                    exc_info=True,
+                )
+                continue
+
+            if verdict.action == "kill":
+                if kill_group(record.pgid, record.pid):
+                    killed += 1
+                    self.logger.warning(
+                        "Program '%s': killed orphaned process group %d (pid %d) - %s",
+                        record.name,
+                        record.pgid,
+                        record.pid,
+                        verdict.reason,
+                    )
+            elif verdict.action == "warn":
+                self.logger.warning(
+                    "Program '%s': pid %d is still running - %s",
+                    record.name,
+                    record.pid,
+                    verdict.reason,
+                )
+            elif "NOT ours" in verdict.reason:
+                # Deliberately loud: this is the guard doing its job, and a
+                # silent refusal looks identical to never having checked.
+                self.logger.info(
+                    "Program '%s': %s - not touching it", record.name, verdict.reason
+                )
+
+        if killed:
+            self.logger.warning(
+                "Reconciled %d orphaned process group(s) from a previous supervisor", killed
+            )
+
+    async def _on_child_state_change(self, event: Event) -> None:
+        """Re-snapshot whenever a child starts or stops."""
+        self._record_children()
+
+    def _record_children(self) -> None:
+        """Snapshot live children so the next start can find them. Never raises."""
+        if self.state_store is None:
+            return
+        records = []
+        for process in self.processes.values():
+            child = process.process
+            if child is None or child.returncode is not None:
+                continue
+            try:
+                pgid = os.getpgid(child.pid)
+            except OSError:
+                pgid = 0
+            token = process_start_token(child.pid)
+            if token is None:
+                # No identity means the next start could not safely act on this
+                # record, so recording it would only invite a pid-only match.
+                continue
+            records.append(
+                ChildRecord(
+                    name=process.config.name,
+                    pid=child.pid,
+                    pgid=pgid,
+                    token=token,
+                    pdeathsig=process.config.pdeathsig,
+                    reconcile=process.config.reconcile,
+                )
+            )
+        try:
+            self.state_store.save(records)
+        except Exception:
+            self.logger.warning("Could not write reconciliation state", exc_info=True)
 
     def _handle_signal(self, sig: int) -> None:
         self.logger.info("Received signal %d", sig)
@@ -332,6 +456,13 @@ class Supervisor:
                     "Shutdown timed out after %ds, some processes may not have stopped cleanly",
                     self.config.shutdown_timeout,
                 )
+
+        # Re-snapshot rather than clear. A clean shutdown usually leaves
+        # nothing, but the shutdown timeout above can expire with children
+        # still alive -- and those are exactly the orphans the next start needs
+        # to know about. Clearing unconditionally would discard the record of
+        # the one shutdown that did not go to plan.
+        self._record_children()
 
         # Release the pidfile lock *last* — only after all children have been
         # stopped (or the shutdown timeout fired). Releasing earlier would let a

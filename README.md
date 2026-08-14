@@ -145,6 +145,7 @@ supervicectl -s /var/run/supervice.sock status
 | `stdout_logfile_maxbytes` / `stderr_logfile_maxbytes` | `50MB` | Child log rotation threshold (0 disables) |
 | `stdout_logfile_backups` / `stderr_logfile_backups` | `10` | Rotated child log backups to keep |
 | `pdeathsig` | `true` | Linux/FreeBSD: SIGKILL the **direct child** if the supervisor dies. One generation only — grandchildren are never covered; see [docs](docs/configuration.md#pdeathsig-scope) |
+| `reconcile` | `auto` | Orphans of a crashed supervisor found at startup: `auto`, `kill`, `warn`, `off`. Matches on identity, not pid — see [docs](docs/configuration.md#reconcile) |
 | `environment` | *(none)* | Environment variables: `KEY=VAL,KEY2="val with,comma"` |
 | `env_file` | *(none)* | Comma-separated `KEY=VALUE` secrets files (`#` comments, quotes stripped); read as the supervisor before the privilege drop. Later files win; `environment` overrides `env_file` |
 | `directory` | *(none)* | Working directory for the process |

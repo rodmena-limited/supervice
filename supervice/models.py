@@ -70,6 +70,10 @@ class ProgramConfig:
     # of coupling child lifetime to the supervisor's). Set false to let
     # children survive a supervisor crash.
     pdeathsig: bool = True
+    # What to do with an orphan of a previous supervisor found at startup.
+    # 'auto' honours pdeathsig: kill if it was requested, warn if it was
+    # deliberately disabled. See supervice/reconcile.py.
+    reconcile: str = "auto"
     healthcheck: HealthCheckConfig = field(default_factory=HealthCheckConfig)
 
 
@@ -84,4 +88,8 @@ class SupervisorConfig:
     shutdown_timeout: int = 30  # seconds to wait for graceful shutdown
     log_maxbytes: int = 50 * 1024 * 1024  # 50MB default
     log_backups: int = 10  # number of backup log files
+    # Where spawned children are recorded so a restart can find orphans of a
+    # previous instance. Empty means "derive it from pidfile" -- it must stay
+    # per-supervisor, or concurrent daemons would reconcile each other.
+    state_file: str = ""
     programs: list[ProgramConfig] = field(default_factory=list)

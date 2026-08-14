@@ -1,0 +1,303 @@
+"""Startup reconciliation: find children a previous supervisor left behind.
+
+WHY THIS EXISTS
+---------------
+`pdeathsig` asks the kernel to kill a child when its parent dies. It covers
+exactly one generation, and only on Linux and FreeBSD. So on macOS, and for the
+grandchildren of any forking program on every platform, an abruptly-killed
+supervisor leaves processes running.
+
+The orphan itself is survivable. The damage is what the *next* start does: with
+no memory of what it spawned, the supervisor sees nothing running and starts a
+second copy alongside the first. Measured on Darwin, supervice 0.3.0: four
+orphaned children before a restart, five after. For a port-binding service that
+is a hard failure; for a queue consumer it is a silent duplicate-worker bug.
+
+This module gives the supervisor that memory.
+
+IDENTITY, NOT PID
+-----------------
+"Record the pid and kill it if alive at startup" is how a supervisor eventually
+SIGKILLs a stranger. Pids are recycled -- the pid space wraps in under five
+minutes of sustained forking on an ordinary machine -- and reconciliation runs
+at startup, which may be minutes or a week after the crash.
+
+So a record is an *identity*: name, pid, pgid, and an opaque start token that
+changes when the pid is reused. If the token does not match, the process is not
+ours and we do not touch it.
+
+FAIL CLOSED
+-----------
+Every failure path here declines to signal. Unreadable token, unreadable state
+file, unparseable record, missing platform support: all of them mean "do not
+kill", never "assume it is ours". The cost of a false negative is an orphan that
+survives one more restart. The cost of a false positive is killing somebody
+else's process.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import tempfile
+from dataclasses import asdict, dataclass
+
+STATE_VERSION = 1
+
+# Program-level policy for what to do with an identified orphan.
+RECONCILE_AUTO = "auto"  # kill if the program wanted pdeathsig, else warn
+RECONCILE_KILL = "kill"
+RECONCILE_WARN = "warn"
+RECONCILE_OFF = "off"
+RECONCILE_CHOICES = (RECONCILE_AUTO, RECONCILE_KILL, RECONCILE_WARN, RECONCILE_OFF)
+
+
+@dataclass(frozen=True)
+class ChildRecord:
+    """One spawned child, as it was at spawn time."""
+
+    name: str
+    pid: int
+    pgid: int
+    token: str
+    pdeathsig: bool
+    reconcile: str
+
+
+def _linux_token(pid: int) -> str | None:
+    """Start time from /proc/<pid>/stat field 22, plus pgid and command line.
+
+    Field 22 is ticks since boot and is monotonic -- it is never rewritten, and
+    it keeps climbing for the life of the machine. That is what makes it a valid
+    recycling guard: a pid reused minutes later necessarily carries a much
+    larger value than the one recorded, so the tokens cannot match.
+
+    Note the resolution is a clock tick (10ms at 100Hz), so two processes
+    started in the SAME tick share a start time. That is not a weakness here:
+    processes alive simultaneously cannot share a pid, and by the time a pid is
+    recycled the counter has moved on by many thousands of ticks. pgid and the
+    command line are folded in as cheap defence in depth rather than because
+    the start time needs help.
+
+    The comm field can contain both spaces and parentheses, so the split must be
+    taken after the LAST ')' rather than by naive whitespace splitting.
+    """
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        fields = raw[raw.rindex(")") + 2 :].split()
+        starttime = fields[19]
+        pgid = fields[2]
+    except (ValueError, IndexError):
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fb:
+            cmdline = fb.read().replace(b"\0", b" ").strip().decode("utf-8", "replace")
+    except OSError:
+        cmdline = ""
+    return "starttime:%s pgid:%s cmd:%s" % (starttime, pgid, cmdline)
+
+
+def _ps_token(pid: int) -> str | None:
+    """Fallback for platforms without /proc: ps start time + pgid + command.
+
+    `lstart` is second-resolution, which on its own is a weak anchor -- a burst
+    of spawns shares one value. Combined with the process group id and the exact
+    command string it is considerably stronger: a recycled pid would have to
+    land in the same second AND the same process group AND be running the same
+    command to be mistaken for ours.
+
+    Microsecond start times are available via sysctl(KERN_PROC_PID) on Darwin
+    and FreeBSD and would be a better anchor. That is deliberately not used yet:
+    the kinfo_proc field offsets differ per platform and release, and shipping
+    struct offsets that have not been verified on the target would be exactly
+    the kind of unvalidated assumption this module exists to avoid.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart=,pgid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = out.stdout.strip()
+    if out.returncode != 0 or not line:
+        return None
+    return "ps:%s" % " ".join(line.split())
+
+
+def process_start_token(pid: int) -> str | None:
+    """An opaque identity token for a live pid, or None if it cannot be read.
+
+    None means "cannot establish identity" and callers MUST treat it as a
+    refusal to act, never as "not ours" or "already gone" -- both of those are
+    also None, and conflating them is how a guard turns into a no-op.
+    """
+    if pid <= 0:
+        return None
+    token = _linux_token(pid)
+    if token is not None:
+        return token
+    return _ps_token(pid)
+
+
+class StateStore:
+    """Per-supervisor record of spawned children, as atomically-replaced JSON.
+
+    Deliberately NOT a single shared path such as ~/.supervice.state: supervice
+    supports several daemons running concurrently with different configs, and a
+    shared store would have one supervisor read another's records at startup and
+    kill its children.
+
+    JSON with tmp+rename rather than SQLite: one writer, a handful of rows,
+    written on spawn/exit and read once at startup. rename(2) is atomic on
+    POSIX, so a crash mid-write leaves the previous good file rather than a torn
+    one, and there are no lock or -wal files to wedge. An operator can also read
+    or delete it by hand mid-incident, which matters more than transactions for
+    data this small.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    @staticmethod
+    def default_path(pidfile: str) -> str:
+        """Sit beside the pidfile, which is already per-supervisor."""
+        base = os.path.abspath(pidfile or "supervice.pid")
+        directory = os.path.dirname(base) or "."
+        stem = os.path.basename(base)
+        for suffix in (".pid", ".pidfile"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        return os.path.join(directory, ".%s.state.json" % (stem or "supervice"))
+
+    def load(self) -> list[ChildRecord]:
+        """Read records. Any problem yields an empty list, never a partial one."""
+        try:
+            with open(self.path) as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(blob, dict) or blob.get("version") != STATE_VERSION:
+            return []
+        records = []
+        for item in blob.get("children", []):
+            try:
+                records.append(
+                    ChildRecord(
+                        name=str(item["name"]),
+                        pid=int(item["pid"]),
+                        pgid=int(item["pgid"]),
+                        token=str(item["token"]),
+                        pdeathsig=bool(item["pdeathsig"]),
+                        reconcile=str(item.get("reconcile", RECONCILE_AUTO)),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                # Skip the unparseable record rather than dropping the file: a
+                # malformed entry must not disarm reconciliation for the rest.
+                continue
+        return records
+
+    def save(self, records: list[ChildRecord]) -> None:
+        """Atomically replace the state file. Best effort; never raises."""
+        blob = {"version": STATE_VERSION, "children": [asdict(r) for r in records]}
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".supervice-state-")
+            with os.fdopen(fd, "w") as f:
+                json.dump(blob, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
+            tmp_path = None
+        except OSError:
+            pass
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def clear(self) -> None:
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What reconciliation decided about one record, and why."""
+
+    record: ChildRecord
+    action: str  # "kill" | "warn" | "skip"
+    reason: str
+
+
+def decide(record: ChildRecord) -> Verdict:
+    """Decide what to do about one recorded child. Pure; signals nothing."""
+    if record.reconcile == RECONCILE_OFF:
+        return Verdict(record, "skip", "reconcile=off for this program")
+
+    token = process_start_token(record.pid)
+    if token is None:
+        # Covers "already gone" and "cannot read identity" alike. Both must
+        # decline: we cannot tell them apart, and only one of them is safe.
+        return Verdict(record, "skip", "pid %d is gone or its identity cannot be read" % record.pid)
+
+    if token != record.token:
+        return Verdict(
+            record,
+            "skip",
+            "pid %d is alive but is NOT ours (start token differs; pid was recycled)" % record.pid,
+        )
+
+    if record.reconcile == RECONCILE_WARN:
+        return Verdict(record, "warn", "reconcile=warn for this program")
+    if record.reconcile == RECONCILE_KILL:
+        return Verdict(record, "kill", "reconcile=kill for this program")
+
+    # RECONCILE_AUTO. Honour what the program asked for on the previous run.
+    if record.pdeathsig:
+        return Verdict(record, "kill", "orphan of a previous supervisor (pdeathsig was requested)")
+    # pdeathsig=false is a deliberate opt-out: surviving a supervisor crash is
+    # the INTENDED outcome, so killing here would silently invert a documented
+    # guarantee. But the duplicate-spawn that follows is not intended, and
+    # saying nothing is how it stays invisible.
+    return Verdict(
+        record,
+        "warn",
+        "orphan of a previous supervisor; pdeathsig=false so it is left running "
+        "-- starting this program will create duplicates",
+    )
+
+
+def kill_group(pgid: int, pid: int) -> bool:
+    """SIGKILL the orphan's process group, falling back to the pid.
+
+    The group is the point: pdeathsig cannot reach grandchildren on any
+    platform, and children are spawned with start_new_session=True, so the
+    group is exactly the subtree this supervisor created.
+    """
+    if pgid > 0:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return True
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except OSError:
+        return False
