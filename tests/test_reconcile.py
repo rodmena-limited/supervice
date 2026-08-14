@@ -258,6 +258,31 @@ class TestStartToken(unittest.TestCase):
             b.kill()
             b.wait()
 
+    def test_token_is_stable_from_the_instant_of_spawn(self) -> None:
+        """The token read immediately after fork must equal the one read later.
+
+        Regression guard. The token briefly included the command line, which is
+        empty between fork and exec (198 of 300 spawns on the development
+        machine) and is rewritten by long-running servers that use setproctitle.
+        Either made the recorded token stop matching a perfectly healthy child.
+        It failed closed, so nothing was killed wrongly -- reconciliation just
+        silently stopped working, for pre-forking servers most of all, which are
+        exactly what it exists to protect.
+        """
+        mismatches = 0
+        for _ in range(40):
+            proc = spawn_sleeper()
+            try:
+                at_spawn = process_start_token(proc.pid)
+                time.sleep(0.05)
+                later = process_start_token(proc.pid)
+                if at_spawn is None or at_spawn != later:
+                    mismatches += 1
+            finally:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(mismatches, 0, "token changed between spawn and later read")
+
     def test_nonexistent_and_invalid_pids_yield_none(self) -> None:
         for pid in (0, -1, 999999):
             with self.subTest(pid=pid):

@@ -261,6 +261,35 @@ pdeathsig = true
         finally:
             os.unlink(path)
 
+    def test_host_wide_warning_is_emitted_once_not_per_program(self) -> None:
+        """N programs on an unsupported host must produce ONE line, not N.
+
+        pdeathsig defaults to true, so a stock 20-program config on macOS
+        previously emitted 20 identical warnings about a host-wide condition no
+        per-program change can fix -- which trains readers to skim past the one
+        warning that does matter. Reported by macbook-admin-bd8e86.
+        """
+        body = "[supervice]\npidfile=\n" + "".join(
+            "\n[program:p%d]\ncommand = sleep 60\npdeathsig = true\n" % i for i in range(8)
+        )
+        path = write_config(body)
+        try:
+            sup = Supervisor()
+            handler = capture_logs()
+            try:
+                with mock.patch.object(proc, "_LIBC", None):
+                    sup.load_config(path)
+            finally:
+                release_logs(handler)
+            lines = [r.getMessage() for r in handler.records if "pdeathsig" in r.getMessage()]
+            self.assertEqual(len(lines), 1, "expected one host-wide line, got: %r" % lines)
+            # It must still name the affected programs, or the operator cannot
+            # tell which of their config is impacted.
+            self.assertIn("p0", lines[0])
+            self.assertIn("8 total", lines[0])
+        finally:
+            os.unlink(path)
+
     def test_warns_when_supported_but_not_functional(self) -> None:
         """The previously silent case: libc loaded, syscall broken (e.g. a jail)."""
         path = write_config(self.CONFIG)

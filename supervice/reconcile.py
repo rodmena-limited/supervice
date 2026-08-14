@@ -77,9 +77,19 @@ def _linux_token(pid: int) -> str | None:
     Note the resolution is a clock tick (10ms at 100Hz), so two processes
     started in the SAME tick share a start time. That is not a weakness here:
     processes alive simultaneously cannot share a pid, and by the time a pid is
-    recycled the counter has moved on by many thousands of ticks. pgid and the
-    command line are folded in as cheap defence in depth rather than because
-    the start time needs help.
+    recycled the counter has moved on by many thousands of ticks. pgid is folded
+    in as cheap defence in depth rather than because the start time needs help.
+
+    The command line is deliberately NOT part of the token, though it looks like
+    free extra identity. Two reasons, both measured:
+      - it is empty for a window after fork and before exec completes (198 of
+        300 spawns on this machine), so a token taken at spawn could never match
+        again;
+      - long-running servers rewrite their own argv (setproctitle, gunicorn),
+        so it changes under a healthy process.
+    Either way the mismatch fails closed, which is safe but silently disables
+    reconciliation -- for pre-forking servers most of all, which are exactly the
+    programs this feature exists to protect.
 
     The comm field can contain both spaces and parentheses, so the split must be
     taken after the LAST ')' rather than by naive whitespace splitting.
@@ -91,26 +101,21 @@ def _linux_token(pid: int) -> str | None:
         return None
     try:
         fields = raw[raw.rindex(")") + 2 :].split()
-        starttime = fields[19]
-        pgid = fields[2]
+        return "starttime:%s pgid:%s" % (fields[19], fields[2])
     except (ValueError, IndexError):
         return None
-    try:
-        with open("/proc/%d/cmdline" % pid, "rb") as fb:
-            cmdline = fb.read().replace(b"\0", b" ").strip().decode("utf-8", "replace")
-    except OSError:
-        cmdline = ""
-    return "starttime:%s pgid:%s cmd:%s" % (starttime, pgid, cmdline)
 
 
 def _ps_token(pid: int) -> str | None:
-    """Fallback for platforms without /proc: ps start time + pgid + command.
+    """Fallback for platforms without /proc: ps start time + pgid.
 
-    `lstart` is second-resolution, which on its own is a weak anchor -- a burst
-    of spawns shares one value. Combined with the process group id and the exact
-    command string it is considerably stronger: a recycled pid would have to
-    land in the same second AND the same process group AND be running the same
-    command to be mistaken for ours.
+    `lstart` is second-resolution, which is coarse -- a burst of spawns shares
+    one value -- but the threat is a pid reused MINUTES later, and minutes are
+    resolvable in seconds. Simultaneous processes sharing a start second cannot
+    share a pid, so the coarseness costs nothing here.
+
+    The command column is excluded for the same reasons as on Linux: it is
+    unstable after fork and rewritable by the process itself.
 
     Microsecond start times are available via sysctl(KERN_PROC_PID) on Darwin
     and FreeBSD and would be a better anchor. That is deliberately not used yet:
@@ -120,7 +125,7 @@ def _ps_token(pid: int) -> str | None:
     """
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart=,pgid=,command="],
+            ["ps", "-p", str(pid), "-o", "lstart=,pgid="],
             capture_output=True,
             text=True,
             timeout=10,
