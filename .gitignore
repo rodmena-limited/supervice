@@ -26,3 +26,9 @@ docs/_build/
 *.swp
 *~
 .DS_Store
+.claude/settings.local.json
+.agentbus/
+.omo/
+
+# Local issuedb ticket store. The durable in-repo record is SPECS/.
+.issue.db
