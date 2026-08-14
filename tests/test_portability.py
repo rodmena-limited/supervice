@@ -1,6 +1,8 @@
 import io
 import logging
+import ast
 import os
+import re
 import shutil
 import signal
 import stat
@@ -498,3 +500,120 @@ class TestVersionFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPsArgumentPortability(unittest.TestCase):
+    """§6: ps invocations must use forms that work on Linux, FreeBSD and macOS.
+
+    Two FreeBSD-blind forms cost real guards in this project:
+
+      comma-joined -o specs   `-o lstart=,pgid=` is a GNU/Darwin extension.
+                              FreeBSD reads everything after the first comma as
+                              the FIRST column's header, so the second field is
+                              never requested. The reconciliation identity token
+                              silently lost its process-group component.
+      -e for "all processes"  On FreeBSD `-e` means "display the environment".
+                              `ps -eo pid=,command=` returned 18 getty lines, so
+                              the e2e harness could not see its own child and
+                              reported that as a supervice failure.
+
+    Both exit 0 and print plausible output, which is why they survived review.
+
+    The pattern below matches the DEFECT SIGNATURE rather than the invocation:
+    two field specs joined by a comma look identical in every calling
+    convention, so this catches -o, -eo, -axo, -Ao and any future bundle. An
+    earlier pattern keyed on the literal "-o" reported a clean sweep while
+    line 56 sat in plain sight. Validated by bikeroom-freebsd-operato-dd8bca
+    against a 9-fixture corpus: 5/5 positives, 0/4 false positives.
+    """
+
+    COMMA_JOINED = re.compile(r"[a-zA-Z_]+=,[a-zA-Z_]+=")
+
+    def _sources(self) -> list[str]:
+        """Every .py in the repo except this file.
+
+        This file is excluded because it necessarily CONTAINS the defect
+        signature -- the fixtures in test_the_pattern_itself_can_go_red exist to
+        prove the scanner matches them. Scanning ourselves would make the guard
+        permanently red for the wrong reason, and a permanently-red check gets
+        muted, which is how it stops guarding anything.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        me = os.path.abspath(__file__)
+        found = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in {".git", "_build", "__pycache__"}]
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                if name.endswith(".py") and os.path.abspath(path) != me:
+                    found.append(path)
+        return found
+
+    def test_the_pattern_itself_can_go_red(self) -> None:
+        """A scanner never shown matching cannot report absence."""
+        for bad in (
+            '["ps", "-p", pid, "-o", "lstart=,pgid="]',
+            '["ps", "-eo", "pid=,command="]',
+            '["ps", "-axo", "pid=,command="]',
+            "ps -o lstart=,pgid= -p $P",
+        ):
+            with self.subTest(fixture=bad):
+                self.assertRegex(bad, self.COMMA_JOINED)
+        for good in (
+            '["ps", "-p", pid, "-o", "command="]',
+            '["ps", "-A", "-o", "pid=", "-o", "command="]',
+            "ps -ax -o pid= -o command=",
+        ):
+            with self.subTest(fixture=good):
+                self.assertNotRegex(good, self.COMMA_JOINED)
+
+    def _offending_string_literals(self, path: str) -> list[int]:
+        """Line numbers of STRING LITERALS that are a comma-joined ps spec.
+
+        Deliberately not a plain line scan. Every place this defect is
+        DESCRIBED -- docstrings, comments explaining why it was wrong -- would
+        match a line scan, so the guard would be permanently red and would get
+        muted. Muting it is how the defect comes back.
+
+        A real invocation is an argv element whose ENTIRE value is the spec
+        (`"lstart=,pgid="`). Prose never is. Tokenizing also skips comments for
+        free. This is precise about the thing that breaks rather than about
+        every mention of it.
+        """
+        import io as _io
+        import tokenize
+
+        offenders = []
+        with open(path, "rb") as fb:
+            try:
+                tokens = list(tokenize.tokenize(_io.BytesIO(fb.read()).readline))
+            except (tokenize.TokenError, SyntaxError, IndentationError):
+                return []
+        for tok in tokens:
+            if tok.type != tokenize.STRING:
+                continue
+            try:
+                value = ast.literal_eval(tok.string)
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(value, str) and self.COMMA_JOINED.fullmatch(value.strip()):
+                offenders.append(tok.start[0])
+        return offenders
+
+    def test_no_comma_joined_ps_specs_in_the_repo(self) -> None:
+        offenders = []
+        for path in self._sources():
+            for lineno in self._offending_string_literals(path):
+                offenders.append("%s:%d" % (path, lineno))
+        self.assertEqual(offenders, [], "comma-joined ps -o spec (breaks on FreeBSD)")
+
+    def test_no_dash_e_for_all_processes(self) -> None:
+        """`-e` means 'show the environment' on FreeBSD, not 'all processes'."""
+        offenders = []
+        for path in self._sources():
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            for form in ('"-eo"', '"-e"', "'-eo'"):
+                if form in text and '"ps"' in text:
+                    offenders.append("%s (%s)" % (path, form))
+        self.assertEqual(offenders, [], "use -A for all processes; -e differs on FreeBSD")
