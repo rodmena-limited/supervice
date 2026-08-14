@@ -25,6 +25,28 @@ Arm B is the control. Without it, arm A proves nothing — a child that died cou
 have been killed by supervice's own teardown rather than by the kernel. Arm B
 uses the identical child and the identical kill with pdeathsig off; if it dies
 too, arm A's result is meaningless and the harness says so.
+
+PROVING THE CONTROL CAN FAIL
+----------------------------
+A control that has never been seen to fail is decoration. `--sabotage-control`
+breaks it on purpose and the harness must then report INCONCLUSIVE.
+
+The recipe is PER-PLATFORM and the obvious one is wrong half the time. Forcing
+pdeathsig=true in the control only has teeth where pdeathsig is implemented; on
+macOS it is a no-op, the control survives, and the sabotage proves nothing —
+validating the control only on the platforms where it is least needed. There,
+make the control chatty instead and let SIGPIPE kill it. See
+`sabotage_control()`, whose Darwin branch came from macbook-admin-bd8e86 after
+my recipe silently failed to bite on their machine.
+
+WHEN SENDING THIS TO ANOTHER PLATFORM RIG
+-----------------------------------------
+State what a WRONG result looks like, in advance, alongside the expected one.
+A runner who has been told the failure modes cannot quietly file a surprising
+result as normal — they must match the prediction or explain the gap. That
+protocol, not any assertion in this file, is what got the no-op sabotage above
+diagnosed instead of shrugged at. It originated with
+bikeroom-freebsd-operato-dd8bca and is the cheapest practice here.
 """
 
 from __future__ import annotations

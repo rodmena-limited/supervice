@@ -144,7 +144,7 @@ supervicectl -s /var/run/supervice.sock status
 | `stderr_logfile` | *(none)* | File for stderr (rotated by the daemon; supports `%(process_num)s`) |
 | `stdout_logfile_maxbytes` / `stderr_logfile_maxbytes` | `50MB` | Child log rotation threshold (0 disables) |
 | `stdout_logfile_backups` / `stderr_logfile_backups` | `10` | Rotated child log backups to keep |
-| `pdeathsig` | `true` | Linux/FreeBSD: SIGKILL the child if the supervisor dies |
+| `pdeathsig` | `true` | Linux/FreeBSD: SIGKILL the **direct child** if the supervisor dies. One generation only — grandchildren are never covered; see [docs](docs/configuration.md#pdeathsig-scope) |
 | `environment` | *(none)* | Environment variables: `KEY=VAL,KEY2="val with,comma"` |
 | `env_file` | *(none)* | Comma-separated `KEY=VALUE` secrets files (`#` comments, quotes stripped); read as the supervisor before the privilege drop. Later files win; `environment` overrides `env_file` |
 | `directory` | *(none)* | Working directory for the process |
@@ -236,9 +236,9 @@ BACKOFF ──┘                    │                     EXITED
 
 | Platform | Status |
 |----------|--------|
-| Linux | **First-class** — full feature set, including `pdeathsig` via `prctl(2)` |
-| FreeBSD | **Supported** (15.x, 13.x) — all features, including `pdeathsig` via `procctl(2)`; see the FreeBSD notes below |
-| macOS | Supported for supervision, **without `pdeathsig`** — no kernel equivalent exists; supervice logs a warning if you request it |
+| Linux | **First-class** — full feature set, including `pdeathsig` via `prctl(2)` (direct child only) |
+| FreeBSD | **Supported** (15.x, 13.x) — all features, including `pdeathsig` via `procctl(2)` (direct child only); see the FreeBSD notes below |
+| macOS | Supported for supervision, **without `pdeathsig`** — no kernel equivalent exists; supervice logs a warning if you request it. Children survive an abrupt supervisor kill |
 
 Field notes from the first production FreeBSD deployment live in
 [`PORTABILITY-FREEBSD.md`](PORTABILITY-FREEBSD.md).
@@ -311,14 +311,39 @@ Notes for FreeBSD operators:
 ### macOS
 
 macOS has no kernel pdeathsig equivalent. `pdeathsig = true` is accepted but
-inactive, and supervice logs a warning at config load. If orphan reaping is
-essential there, a launcher can reap before exec'ing the supervisor — anything
-alive at start is by definition an orphan:
+inactive, and supervice logs a warning at config load. If the supervisor is
+killed abruptly its children survive as orphans, and a later restart will spawn
+duplicates alongside them.
+
+If orphan reaping is essential today, a launcher can reap before exec'ing the
+supervisor:
 
 ```sh
 pkill -u myuser -f 'myapp' || true
 exec supervice -c /etc/supervice.ini -n
 ```
+
+> **Know what this costs before you use it.** `pkill -f` matches on a command
+> string, not on identity. It will kill *any* process whose command line
+> matches — including one that merely looks similar, and including a process
+> that happens to be a different program entirely. There is no check that the
+> process is one supervice started. Scope the pattern as tightly as you can, and
+> prefer a dedicated user account so `-u` does real work.
+>
+> Note also the `exec` on the last line: without it the supervisor would be a
+> child of this script, adding a generation. The same rule applies to your own
+> program wrappers — see
+> [`pdeathsig` scope](docs/configuration.md#pdeathsig-scope).
+
+A supervisor-side replacement that matches on `{pid, pgid, start-time}` rather
+than on a command string is tracked as issue #12; until it lands, the snippet
+above is the available option and the caveat is real.
+
+**Testing orphan behaviour on macOS:** use a **silent** child. A program with a
+`stdout_logfile` is reaped by `SIGPIPE` when the supervisor dies — by accident,
+not by pdeathsig — so the obvious test passes while the guarantee is absent.
+`python3 tests/orphan_harness.py` does this correctly and keeps the
+false-positive case beside it.
 
 ## Documentation
 

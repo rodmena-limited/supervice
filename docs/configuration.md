@@ -92,11 +92,81 @@ process identifier used in CLI commands and status output.
 | `env_file` | string | *(none)* | Comma-separated `KEY=VALUE` secrets files; later files win, `environment` overrides |
 | `directory` | string | *(none)* | Working directory |
 | `user` | string | *(none)* | Run as this user |
-| `pdeathsig` | bool | `true` | Linux/FreeBSD: SIGKILL the child if the supervisor dies |
+| `pdeathsig` | bool | `true` | Linux/FreeBSD: SIGKILL the **direct child** if the supervisor dies — see below |
 
 Child logs are captured through pipes and rotated by the daemon itself
 (`file`, `file.1` … `file.N`), so they cannot grow without bound and no
 external logrotate integration is needed.
+
+(pdeathsig-scope)=
+
+### `pdeathsig` — what it covers, and what it does not
+
+`pdeathsig` asks the kernel to SIGKILL a process when its parent dies, so that
+an abruptly-killed supervisor does not leave orphans behind.
+
+| Platform | Mechanism |
+|---|---|
+| Linux | `prctl(PR_SET_PDEATHSIG)` |
+| FreeBSD | `procctl(PROC_PDEATHSIG_CTL)` |
+| macOS | **none** — accepted but inactive; supervice warns at config load |
+
+**The guarantee is exactly one generation deep.** The kernel clears the
+parent-death signal across `fork()` on both Linux and FreeBSD, so supervice can
+only protect the process it spawns directly. Grandchildren are never covered.
+
+That matters more than it sounds, because most real services fork:
+
+```
+supervisor ──(pdeathsig)──> your command ────> worker 1   ← NOT protected
+                                          └──> worker 2   ← NOT protected
+```
+
+Kill the supervisor and the master dies; every worker survives. The config says
+`pdeathsig = true` and it is telling the truth — about exactly one pid.
+
+There are two different situations here, and only one has a fix.
+
+**Structural — no configuration fixes this.** A pre-forking web server
+(gunicorn, unicorn, php-fpm), a worker pool, or any master/worker split. The
+fork *is* the architecture. `pdeathsig` protects the master; plan for the
+workers separately, or have the master handle its own children on exit.
+
+**Accidental — fixed by one word.** A wrapper script that launches the real
+program *without* `exec` puts it one generation too deep. supervice does not run
+commands through a shell, so your wrapper **is** the protected child — and
+`exec` replaces it in place, keeping the same pid and the signal with it:
+
+```sh
+#!/bin/sh
+# WRONG - realprog is a grandchild, unprotected
+exec_setup_stuff
+realprog --serve
+
+#!/bin/sh
+# RIGHT - exec replaces the wrapper; realprog IS the protected child
+exec_setup_stuff
+exec realprog --serve
+```
+
+Measured on Linux/amd64 and FreeBSD 15.1: with `exec`, the real program reports
+`pdeathsig=9`; without it, `pdeathsig=0`.
+
+**setuid/setgid commands.** The kernel also clears the signal when exec'ing a
+set-user-ID or set-group-ID binary (measured on FreeBSD 15.1). supervice warns
+at config load if a program requests `pdeathsig` and its command resolves to
+one. This does **not** affect the `user` option, which switches uid via
+`setuid(2)` before exec rather than exec'ing a setuid image.
+
+**Testing it.** Use a **silent** child. A program with a `stdout_logfile` has
+its output piped; killing the supervisor closes the read end and `SIGPIPE` kills
+the child on its next write — so a chatty child is reaped by accident whether or
+not `pdeathsig` works, on every platform. `tests/orphan_harness.py` uses a
+silent child and keeps the chatty false-positive case beside it.
+
+**Turning it off.** `pdeathsig = false` is a deliberate opt-out: children then
+survive a supervisor crash. Choose it when riding out a supervisor restart
+matters more than never orphaning.
 
 ### `command`
 

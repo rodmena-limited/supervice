@@ -55,7 +55,9 @@ class ProgramConfig:
     directory: str | None = None
     user: str | None = None
     group: str | None = None
-    pdeathsig: bool = True  # Linux: SIGKILL children if the supervisor dies
+    pdeathsig: bool = True  # Linux (prctl) + FreeBSD (procctl): SIGKILL the
+                            # DIRECT child if the supervisor dies. Not macOS.
+                            # Does not reach grandchildren - see configuration.md
     healthcheck: HealthCheckConfig = field(default_factory=HealthCheckConfig)
 ```
 
