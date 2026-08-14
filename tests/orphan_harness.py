@@ -149,8 +149,8 @@ async def _child_pid_via_rpc(sock: str) -> int | None:
     return None
 
 
-def run_arm(arm: str, *, pdeathsig: bool, chatty: bool, description: str) -> ArmResult:
-    result = ArmResult(arm, description)
+def run_arm(arm: str, *, pdeathsig: bool, chatty: bool) -> ArmResult:
+    result = ArmResult(arm, describe(arm, pdeathsig, chatty))
     marker = "orphanprobe_%s" % uuid.uuid4().hex[:12]
 
     with tempfile.TemporaryDirectory(prefix="supervice-orphan-") as tmp:
@@ -200,46 +200,88 @@ def run_arm(arm: str, *, pdeathsig: bool, chatty: bool, description: str) -> Arm
     return result
 
 
-ARMS = {
-    "A": dict(
-        pdeathsig=True,
-        chatty=False,
-        description="pdeathsig=true, SILENT child - the real claim",
-    ),
-    "B": dict(
-        pdeathsig=False,
-        chatty=False,
-        description="pdeathsig=false, SILENT child - CONTROL, must survive",
-    ),
-    "C": dict(
-        pdeathsig=True,
-        chatty=False,
-        description="",  # replaced below
-    ),
+ROLES = {
+    "A": "the real claim",
+    "B": "CONTROL, must survive",
+    "C": "SIGPIPE false positive",
 }
-ARMS["C"] = dict(
-    pdeathsig=True,
-    chatty=True,
-    description="pdeathsig=true, CHATTY child + logfile - SIGPIPE false positive",
-)
+
+ARMS: dict[str, dict[str, bool]] = {
+    "A": dict(pdeathsig=True, chatty=False),
+    "B": dict(pdeathsig=False, chatty=False),
+    "C": dict(pdeathsig=True, chatty=True),
+}
+
+
+def describe(arm: str, pdeathsig: bool, chatty: bool) -> str:
+    """Build the arm label from the flags ACTUALLY used for the run.
+
+    Deliberately derived, never stored. A hardcoded label decoupled from the
+    flags beside it misdescribes exactly the runs where the label matters most
+    — someone running a sabotaged variant to investigate a strange result — and
+    a pasted log then sends the next reader hunting a phantom. Reported by
+    macbook-admin-bd8e86 after two sabotage runs printed "SILENT" for a chatty
+    control.
+    """
+    return "pdeathsig=%-5s %s child%s - %s" % (
+        "true" if pdeathsig else "false",
+        "CHATTY" if chatty else "SILENT",
+        " + logfile" if chatty else "",
+        ROLES[arm],
+    )
+
+
+def sabotage_control(arms: dict[str, dict[str, bool]]) -> str:
+    """Break the control on purpose, by a mechanism that works on THIS platform.
+
+    The control exists to prove that a dead child in arm A is attributable to
+    pdeathsig. That claim is only worth anything if the control has been shown
+    capable of dying — so this mode exists to demonstrate it, and the harness
+    must then report INCONCLUSIVE.
+
+    The recipe is platform-specific and the obvious one is wrong half the time.
+    Forcing pdeathsig=true in the control has teeth only where pdeathsig is
+    implemented; on macOS it is a no-op, the control survives, and the sabotage
+    silently proves nothing. So on a platform with no parent-death signal, make
+    the control chatty instead and let SIGPIPE do it.
+
+    Carried here as a recipe rather than left as folklore, because the wrong
+    recipe reads exactly like the right one.
+    """
+    if sys.platform == "linux" or sys.platform.startswith("freebsd"):
+        arms["B"]["pdeathsig"] = True
+        return "forced pdeathsig=true in the control (kernel parent-death signal)"
+    arms["B"]["chatty"] = True
+    return "made the control chatty with a logfile (SIGPIPE; no pdeathsig on this platform)"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--arm", choices=sorted(ARMS), help="run a single arm")
+    ap.add_argument(
+        "--sabotage-control",
+        action="store_true",
+        help="break the control on purpose; the harness MUST then report INCONCLUSIVE",
+    )
     args = ap.parse_args()
 
     selected = [args.arm] if args.arm else sorted(ARMS)
 
+    arms = {k: dict(v) for k, v in ARMS.items()}
+    sabotage = sabotage_control(arms) if args.sabotage_control else None
+
     print("supervice orphan harness")
     print("platform : %s %s (%s)" % (platform.system(), platform.release(), platform.machine()))
     print("python   : %s" % platform.python_version())
+    if sabotage:
+        print("SABOTAGE : %s" % sabotage)
+        print("           expecting INCONCLUSIVE; any verdict means the control is inert")
     print("")
 
     results = []
     conclusive = False
     for arm in selected:
-        spec = ARMS[arm]
+        spec = arms[arm]
         r = run_arm(arm, **spec)  # type: ignore[arg-type]
         results.append(r)
         print(
@@ -249,7 +291,7 @@ def main() -> int:
                 r.supervisor_pid or "-",
                 r.child_pid or "-",
                 r.outcome,
-                r.error or spec["description"],
+                r.error or describe(arm, spec["pdeathsig"], spec["chatty"]),
             )
         )
 
@@ -261,10 +303,14 @@ def main() -> int:
         if a.error or b.error:
             print("INCONCLUSIVE: an arm errored; no claim can be made.")
         elif not b.child_survived:
+            # Describe the control as it was actually configured. Under
+            # --sabotage-control it is not "pdeathsig OFF", and a verdict line
+            # that misstates the setup is the same defect as a mislabelled arm.
             print(
-                "INCONCLUSIVE: the CONTROL child died with pdeathsig OFF, so arm A's\n"
-                "result is not attributable to pdeathsig. Something else is killing\n"
-                "children - investigate before trusting any orphan result here."
+                "INCONCLUSIVE: the CONTROL child died (%s), so arm A's result is not\n"
+                "attributable to pdeathsig. Something else is killing children -\n"
+                "investigate before trusting any orphan result here."
+                % describe("B", arms["B"]["pdeathsig"], arms["B"]["chatty"])
             )
         elif not a.child_survived:
             conclusive = True
