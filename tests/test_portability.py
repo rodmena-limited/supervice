@@ -1,7 +1,9 @@
 import io
 import logging
 import os
+import shutil
 import signal
+import stat
 import sys
 import tempfile
 import unittest
@@ -91,6 +93,108 @@ class TestPdeathsigDispatch(unittest.TestCase):
             self.assertFalse(proc.pdeathsig_supported())
 
 
+class TestPdeathsigFunctionalProbe(unittest.TestCase):
+    """#10: the probe must distinguish a working mechanism from a broken one.
+
+    Every case here is paired. A probe that only ever returns True on this
+    machine would pass a one-sided test while being incapable of reporting a
+    failure, which is the exact defect it was written to remove.
+    """
+
+    def setUp(self) -> None:
+        proc._pdeathsig_functional_cache = None
+
+    def tearDown(self) -> None:
+        proc._pdeathsig_functional_cache = None
+
+    @unittest.skipUnless(
+        sys.platform == "linux" or sys.platform.startswith("freebsd"),
+        "no parent-death-signal mechanism on this platform",
+    )
+    def test_green_on_a_working_host(self) -> None:
+        self.assertTrue(proc.pdeathsig_functional())
+
+    @unittest.skipUnless(
+        sys.platform == "linux" or sys.platform.startswith("freebsd"),
+        "no parent-death-signal mechanism on this platform",
+    )
+    def test_probe_does_not_mutate_the_supervisor(self) -> None:
+        """The supervisor must not acquire a parent-death signal of its own."""
+        before = proc._pdeathsig_get()
+        proc.pdeathsig_functional()
+        self.assertEqual(proc._pdeathsig_get(), before)
+
+    def test_red_when_the_set_syscall_fails(self) -> None:
+        """The case that matters: supported, but the syscall does not work."""
+        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
+            with mock.patch.object(proc, "_pdeathsig_set", return_value=-1):
+                self.assertFalse(proc.pdeathsig_functional())
+
+    def test_red_when_readback_disagrees(self) -> None:
+        """A set that claims success but does not stick is still a failure."""
+        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
+            with mock.patch.object(proc, "_pdeathsig_set", return_value=0):
+                with mock.patch.object(proc, "_pdeathsig_get", return_value=(0, 0)):
+                    self.assertFalse(proc.pdeathsig_functional())
+
+    def test_red_when_libc_absent(self) -> None:
+        with mock.patch.object(proc, "_LIBC", None):
+            self.assertFalse(proc.pdeathsig_functional())
+
+    def test_forks_at_most_once(self) -> None:
+        """Counted on os.fork in the PARENT.
+
+        Not on _pdeathsig_set: that runs in the forked child, where a mock's
+        call_count is recorded in a copy of memory the parent never sees. Such
+        an assertion reads as 'called 0 times' forever and would pass whether
+        the probe ran once, twice, or never.
+        """
+        real_fork = os.fork
+        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
+            with mock.patch.object(proc.os, "fork", side_effect=real_fork) as forked:
+                self.assertIsNotNone(proc.pdeathsig_functional())
+                self.assertIsNotNone(proc.pdeathsig_functional())
+        self.assertEqual(forked.call_count, 1, "probe must fork at most once")
+
+
+class TestSetuidCommandDetection(unittest.TestCase):
+    """#11: pdeathsig is cleared by the kernel when exec'ing a setuid image.
+
+    Measured on FreeBSD 15.1: ordinary execve keeps pdeathsig=9, setuid execve
+    (uid 1005 -> 65534) yields pdeathsig=0.
+    """
+
+    def test_ordinary_binaries_are_not_flagged(self) -> None:
+        for command in ("%s -c pass" % sys.executable, "/bin/sleep 60"):
+            with self.subTest(command=command):
+                self.assertIsNone(proc.setuid_binary(command))
+
+    def test_setuid_binary_is_flagged(self) -> None:
+        """Find a real setuid binary on this host, or skip honestly.
+
+        Deliberately not mocked: mocking os.stat here would test that the
+        function reads the bit we handed it, not that it recognises a real one.
+        """
+        for candidate in ("sudo", "su", "passwd", "mount", "ping"):
+            path = shutil.which(candidate)
+            if path is None:
+                continue
+            try:
+                mode = os.stat(path).st_mode
+            except OSError:
+                continue
+            if mode & (stat.S_ISUID | stat.S_ISGID):
+                self.assertEqual(proc.setuid_binary("%s --help" % candidate), path)
+                return
+        self.skipTest("no setuid binary on this host to test against")
+
+    def test_unresolvable_command_is_not_flagged(self) -> None:
+        self.assertIsNone(proc.setuid_binary("definitely-not-a-real-binary-xyz"))
+
+    def test_empty_command_is_not_flagged(self) -> None:
+        self.assertIsNone(proc.setuid_binary(""))
+
+
 class TestInactiveDirectiveWarning(unittest.TestCase):
     """§1b: pdeathsig requested on an unsupported platform must warn at load."""
 
@@ -133,17 +237,47 @@ pdeathsig = true
         finally:
             os.unlink(path)
 
-    def test_no_warning_when_supported(self) -> None:
+    def test_no_warning_when_supported_and_functional(self) -> None:
+        """Silence is only correct when the mechanism actually works.
+
+        Both conditions are forced: a libc handle is present AND the startup
+        probe reports functional. Patching only the first would have this test
+        pass on a host where the syscall is broken -- which is the state #10
+        exists to make loud.
+        """
         path = write_config(self.CONFIG)
         try:
             sup = Supervisor()
             handler = capture_logs()
             try:
-                with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
+                with (
+                    mock.patch.object(proc, "_LIBC", mock.MagicMock()),
+                    mock.patch.object(proc, "_pdeathsig_functional_cache", True),
+                ):
                     sup.load_config(path)
             finally:
                 release_logs(handler)
             self.assertFalse(any("pdeathsig" in r.getMessage() for r in handler.records))
+        finally:
+            os.unlink(path)
+
+    def test_warns_when_supported_but_not_functional(self) -> None:
+        """The previously silent case: libc loaded, syscall broken (e.g. a jail)."""
+        path = write_config(self.CONFIG)
+        try:
+            sup = Supervisor()
+            handler = capture_logs()
+            try:
+                with (
+                    mock.patch.object(proc, "_LIBC", mock.MagicMock()),
+                    mock.patch.object(proc, "_pdeathsig_functional_cache", False),
+                ):
+                    sup.load_config(path)
+            finally:
+                release_logs(handler)
+            joined = " ".join(r.getMessage() for r in handler.records)
+            self.assertIn("pdeathsig", joined)
+            self.assertIn("NOT functional", joined)
         finally:
             os.unlink(path)
 

@@ -27,14 +27,27 @@ passes. This is per-command, not per-host, so no startup probe can catch it.
 Detection validated both directions on Linux: stat the resolved `argv[0]`;
 `sudo`/`passwd`/`su` flagged SETUID/SETGID, `python3`/`/bin/sleep` not flagged.
 
-## Open, not blocking
+## Kernel behaviour — MEASURED, no longer spec-only
 
-The kernel clearing behaviour itself is unverified by measurement. It rests on
-the platform man page plus our own doc. Testing it needs a purpose-built setuid
-helper and root, on a host chosen for it. **The mitigation does not depend on
-the answer.**
+Confirmed on FreeBSD 15.1 by bikeroom-freebsd-operato-dd8bca. Built on `/home`
+(verified suid-capable by reading `mount`), helper setuid to `nobody` (65534,
+holds no privileges — no setuid-root binary existed at any point), run as
+`ledger` (1005) so there is a real credential transition:
 
-## Trap for whoever eventually runs that test
+| Arm | | Result |
+|---|---|---|
+| 1 | CONTROL, ordinary `execve` | `ruid=1005 euid=1005` **pdeathsig=9** |
+| 2 | TEST, setuid `execve` 1005→65534 | `ruid=1005 euid=65534` **pdeathsig=0 — CLEARED** |
+| 3 | NEGATIVE CONTROL, same helper from nosuid `/var/tmp` | setup failed, euid unchanged → **NO VERDICT** |
+
+Arm 1 proves the helper *can* report 9 — without it, the 0 in arm 2 means
+nothing. Arm 3 is the trap below, fired deliberately.
+
+Preserved as `/var/tmp/freebsd-pdeathsig-harness/05-setuid-clearing.sh` on that
+host: refuses to run on a nosuid filesystem, refuses to print a verdict without a
+credential transition, and deletes every binary it builds.
+
+## Trap for whoever re-runs that test
 
 `/tmp` is mounted `nosuid` by default on FreeBSD and on many hardened Linux
 systems. A setuid helper built in `/tmp` has its setuid bit **ignored** at exec,

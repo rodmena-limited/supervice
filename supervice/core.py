@@ -9,7 +9,12 @@ from supervice.config import parse_config
 from supervice.events import EventBus
 from supervice.logger import get_logger
 from supervice.models import HealthCheckType, ProgramConfig, SupervisorConfig
-from supervice.process import Process, pdeathsig_supported
+from supervice.process import (
+    Process,
+    pdeathsig_functional,
+    pdeathsig_supported,
+    setuid_binary,
+)
 from supervice.rpc import RPCServer
 
 
@@ -83,13 +88,39 @@ class Supervisor:
         programs: list[ProgramConfig],
     ) -> None:
         for prog_config in programs:
-            if prog_config.pdeathsig and not pdeathsig_supported():
-                self.logger.warning(
-                    "Program '%s': pdeathsig requested but unsupported on %s; "
-                    "children will survive an abrupt supervisor kill",
-                    prog_config.name,
-                    sys.platform,
-                )
+            if prog_config.pdeathsig:
+                if not pdeathsig_supported():
+                    self.logger.warning(
+                        "Program '%s': pdeathsig requested but unsupported on %s; "
+                        "children will survive an abrupt supervisor kill",
+                        prog_config.name,
+                        sys.platform,
+                    )
+                elif not pdeathsig_functional():
+                    # Supported in principle but the syscall does not work here
+                    # -- a jail or sandbox. Previously silent: the config said
+                    # pdeathsig=true and nothing anywhere said otherwise.
+                    self.logger.warning(
+                        "Program '%s': pdeathsig requested but the mechanism is "
+                        "NOT functional on %s (the syscall failed); children "
+                        "will survive an abrupt supervisor kill",
+                        prog_config.name,
+                        sys.platform,
+                    )
+                else:
+                    suid = setuid_binary(prog_config.command)
+                    if suid is not None:
+                        # The kernel clears the parent-death signal when
+                        # exec'ing a setuid/setgid image, so this one program
+                        # loses it even though the host-wide probe passed.
+                        self.logger.warning(
+                            "Program '%s': command '%s' is a setuid/setgid "
+                            "binary; the kernel clears pdeathsig at exec, so "
+                            "this program's children will survive an abrupt "
+                            "supervisor kill despite pdeathsig=true",
+                            prog_config.name,
+                            suid,
+                        )
             if prog_config.numprocs > 1:
                 for field_name in ("stdout_logfile", "stderr_logfile"):
                     logpath = getattr(prog_config, field_name)
