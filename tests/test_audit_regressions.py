@@ -357,11 +357,21 @@ class TestH4SocketDefault(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
         with patch.dict(os.environ, env, clear=True):
             path = default_socket_path()
-        if os.geteuid() == 0:
+        # Mirror the guard the code actually applies. default_socket_path()
+        # only uses /run when it EXISTS -- FreeBSD has /var/run instead, so the
+        # code correctly falls back to the home directory there. Asserting
+        # /run unconditionally encoded a Linux fact as a universal one and
+        # failed as root on FreeBSD against code that was behaving correctly.
+        # (Found by bikeroom-freebsd-operato-dd8bca on FreeBSD 15.1.)
+        home_sock = os.path.join(os.path.expanduser("~"), ".supervice.sock")
+        if os.geteuid() == 0 and os.path.isdir("/run"):
             self.assertEqual(path, "/run/supervice.sock")
         else:
-            self.assertEqual(path, os.path.join(os.path.expanduser("~"), ".supervice.sock"))
+            self.assertEqual(path, home_sock)
+        # The property that actually matters on every platform: never a
+        # world-writable directory, whichever branch was taken.
         self.assertFalse(path.startswith("/tmp/"))
+        self.assertFalse(path.startswith("/var/tmp/"))
 
 
 class TestChildLogRotation(unittest.TestCase):
