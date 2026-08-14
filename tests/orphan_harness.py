@@ -298,6 +298,16 @@ def main() -> int:
     sabotage = sabotage_control(arms) if args.sabotage_control else None
 
     print("supervice orphan harness")
+    # Print WHICH supervice was imported, not just that one was. An
+    # acceptance run of a published artifact is worthless if cwd shadows
+    # site-packages and it silently tests the checkout instead -- a green
+    # result for code that was never installed. Reported by
+    # macbook-admin-bd8e86, who caught exactly that in a stage-5 run by
+    # printing provenance rather than the verdict.
+    import supervice as _sv
+    print("supervice : %s" % os.path.dirname(_sv.__file__))
+    print("           %s" % ("INSTALLED package" if "site-packages" in _sv.__file__
+                             else "source tree (NOT an installed artifact)"))
     print("platform : %s %s (%s)" % (platform.system(), platform.release(), platform.machine()))
     print("python   : %s" % platform.python_version())
     if sabotage:
