@@ -116,11 +116,45 @@ sustained rate     = 140 spawns/sec
 41,962 spawns in 300s -> pid space WRAPPED (95799 -> ... -> 39694)
 ```
 
-The pid space wraps in under five minutes of sustained spawning; a full cycle
-back to a specific pid is ~10–15 minutes at that rate. A parallel build, a test
-suite, or a CI runner does this incidentally. So a supervisor restarted more
-than ~10 minutes after a crash on a busy Mac can have a bare pid check match a
-completely unrelated live process.
+**The pid space wraps in under five minutes of sustained spawning.** Directly
+observed, twice.
 
-This is why the refusal test is blocking and why the reconciler fails closed
-rather than falling back to a pid-only match.
+**Reusing one *specific* pid is a different and much slower event**, and an
+earlier estimate of 10–15 minutes in this spec was wrong. It extrapolated a
+sustained rate from the first burst; the rate decayed continuously
+(241 → 93 → 51 → 30 → 22 spawns/sec), and a 25-minute run at maximum forking
+rate wrapped the space but did **not** recycle the target pid — it reported
+INCONCLUSIVE and exited non-zero rather than claiming a pass. The realistic
+figure is ~35–40 minutes of uninterrupted maximum-rate forking. The measuring
+machine was also under browser load throughout, so the decay may be contention
+rather than a property of Darwin; that confound is unresolved and the number
+should be treated as indicative only.
+
+**None of this is load-bearing for the design**, which is worth stating plainly
+so the requirement is not re-litigated against a better number later:
+
+- The guard depends on collision being *possible*, not on how fast it can be
+  forced. A pid space that wraps at all can eventually reuse any pid.
+- ~35–40 minutes is the **adversarial floor** — the fastest a machine doing
+  nothing else can force it. It is not the realistic window. Reconciliation runs
+  at *startup*, and the gap between a crash and the next start is unbounded: an
+  operator investigating overnight, a host rebooted, a service re-enabled a week
+  later. Ordinary background activity wraps the space over hours or days.
+- The cost of the guard is one sysctl per recorded pid.
+
+So the reconciler fails closed and the refusal test is blocking regardless of
+where the timing number settles.
+
+### The refusal test must not wait for a wrap
+
+Waiting for the kernel to recycle a pid is a bad test: it takes tens of minutes,
+it is load-dependent, and it can only ever produce INCONCLUSIVE or a very slow
+pass. **The kernel's pid allocator is not the behaviour under test — the
+reconciler's refusal to act on a start-time mismatch is.** Test that directly:
+
+- fork a child, record `(pid, start_time)`, let it exit and reap it, then assert
+  the start-time lookup returns `None` → refusal case 1 (fail closed on a dead
+  pid), deterministic and immediate;
+- construct the mismatch directly rather than waiting for one: assert that a
+  recorded token for pid P never equals the token of a *different* live pid, and
+  that reconciliation declines to signal on any such mismatch.
