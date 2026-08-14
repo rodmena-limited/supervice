@@ -38,7 +38,18 @@ from supervice.reconcile import (
 
 
 def spawn_sleeper() -> subprocess.Popen[bytes]:
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    """Spawn the way the daemon does.
+
+    start_new_session=True matters: supervice always spawns children as session
+    leaders (process.py), so pgid == pid. Spawning with a plain Popen instead
+    leaves every child sharing the test runner's process group, which is a
+    configuration the product never produces -- and on Darwin, where the token
+    is lstart + pgid, it makes distinct children collide for a reason that
+    cannot occur in production.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
 
 
 def record_for(proc: subprocess.Popen[bytes], **kw: object) -> ChildRecord:

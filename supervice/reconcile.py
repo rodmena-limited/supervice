@@ -37,14 +37,23 @@ else's process.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
+import struct
 import subprocess
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 
 STATE_VERSION = 1
+
+# Darwin sysctl(3) selectors for reading a process's start time. Verified on
+# Darwin 27.0.0 arm64: sizeof(kinfo_proc)=648, p_starttime at offset 0.
+CTL_KERN = 1
+KERN_PROC = 14
+KERN_PROC_PID = 1
 
 # Program-level policy for what to do with an identified orphan.
 RECONCILE_AUTO = "auto"  # kill if the program wanted pdeathsig, else warn
@@ -106,6 +115,57 @@ def _linux_token(pid: int) -> str | None:
         return None
 
 
+def _darwin_token(pid: int) -> str | None:
+    """Microsecond start time from sysctl(KERN_PROC_PID) on macOS.
+
+    `ps -o lstart=` is second-resolution, and the ps token carries no pid -- it
+    is lstart + pgid. For a supervice child pgid == pid (each is a session
+    leader), so a recycled pid held by another session leader that started in
+    the SAME second produces a byte-identical token, and reconciliation would
+    kill a process it does not own. Narrow, but a wrong-kill rather than a
+    missed kill, which is the direction the whole guard exists to prevent.
+
+    Microseconds close it. The struct offset is not guessed: sizeof(kinfo_proc)
+    = 648 and p_starttime at offset 0 (extern_proc is the first member, and
+    p_starttime its first field) were verified on the target by
+    macbook-admin-bd8e86 on Darwin 27.0.0 arm64 -- 25/25 distinct tokens for
+    concurrent processes, 12/12 for back-to-back spawns where ps gives 1/12.
+
+    Returns None on any failure so the caller falls back to the ps token: this
+    can only improve resolution, never lose the behaviour we already have.
+
+    Deliberately NOT applied to FreeBSD, whose kinfo_proc layout differs and
+    has not been verified on a real host. Guessing there would be exactly the
+    unvalidated assumption this module exists to avoid, and it costs nothing:
+    FreeBSD has working procctl pdeathsig already.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+    except OSError:
+        return None
+
+    mib = (ctypes.c_int * 4)(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)
+    buf = ctypes.create_string_buffer(4096)
+    size = ctypes.c_size_t(len(buf))
+    try:
+        rc = libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0)
+    except Exception:  # noqa: BLE001 - never let a ctypes problem escape
+        return None
+    # size 0 means the pid is gone; anything shorter than a timeval is unusable.
+    if rc != 0 or size.value < 12:
+        return None
+    try:
+        # struct timeval on Darwin: int64 tv_sec, int32 tv_usec.
+        sec, usec = struct.unpack_from("<qi", buf, 0)
+    except struct.error:
+        return None
+    if sec <= 0:
+        return None
+    return "darwin:%d.%06d" % (sec, usec)
+
+
 def _ps_token(pid: int) -> str | None:
     """Fallback for platforms without /proc: ps start time + pgid.
 
@@ -147,7 +207,12 @@ def process_start_token(pid: int) -> str | None:
     """
     if pid <= 0:
         return None
+    # Best resolution first; each falls back rather than failing, so a
+    # platform-specific reader can only improve on the portable floor.
     token = _linux_token(pid)
+    if token is not None:
+        return token
+    token = _darwin_token(pid)
     if token is not None:
         return token
     return _ps_token(pid)
