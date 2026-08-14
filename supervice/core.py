@@ -21,6 +21,7 @@ from supervice.reconcile import (
     decide,
     kill_group,
     process_start_token,
+    token_is_subsecond,
 )
 from supervice.rpc import RPCServer
 
@@ -266,6 +267,17 @@ class Supervisor:
         except Exception:
             self.logger.warning("Could not read reconciliation state; skipping", exc_info=True)
             return
+
+        if records and not token_is_subsecond():
+            # The guard is weaker here and that must not be silent: on a
+            # second-resolution platform a recycled pid whose new holder started
+            # in the same second is indistinguishable from ours.
+            self.logger.warning(
+                "Reconciliation on %s identifies processes with second-resolution "
+                "start times; a pid recycled within the same second cannot be "
+                "distinguished from the original",
+                sys.platform,
+            )
 
         killed = 0
         for record in records:

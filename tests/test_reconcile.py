@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock as mock
 
 from supervice.config import ConfigValidationError, parse_config
 from supervice.reconcile import (
@@ -32,8 +33,10 @@ from supervice.reconcile import (
     RECONCILE_WARN,
     ChildRecord,
     StateStore,
+    _ps_token,
     decide,
     process_start_token,
+    token_is_subsecond,
 )
 
 
@@ -293,6 +296,78 @@ class TestStartToken(unittest.TestCase):
                 proc.kill()
                 proc.wait()
         self.assertEqual(mismatches, 0, "token changed between spawn and later read")
+
+    def test_ps_token_contains_a_real_pgid_not_a_format_fragment(self) -> None:
+        """Guard the portable fallback against silently losing a component.
+
+        `-o lstart=,pgid=` is a GNU/Darwin extension. FreeBSD parses it as ONE
+        column, so the token became the literal 'ps:,pgid= <date>' -- identical
+        for every process on the host that started in that second. It looked
+        like a working token and was a wrong-kill door.
+
+        Asserted on every platform, not just FreeBSD: the point is that the
+        fallback's shape is checked wherever it can be checked.
+        """
+        proc = spawn_sleeper()
+        try:
+            token = _ps_token(proc.pid)
+            self.assertIsNotNone(token)
+            assert token is not None
+            self.assertNotIn(",pgid=", token)
+            self.assertIn("pgid:%d" % os.getpgid(proc.pid), token)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_format_fragment_in_ps_output_yields_no_token(self) -> None:
+        """A token that cannot be trusted must fail closed, not be emitted.
+
+        No token declines to act; a garbage token collides. On FreeBSD `ps`
+        echoed the literal ",pgid=" instead of expanding it, and the old code
+        folded that straight into an identity.
+        """
+        for bogus in ("", "   ", ",pgid=", ",pgid=\nFri Aug 14 18:01:16 2026"):
+            with self.subTest(output=repr(bogus)):
+                completed = subprocess.CompletedProcess([], 0, bogus, "")
+                with mock.patch("subprocess.run", return_value=completed):
+                    self.assertIsNone(_ps_token(os.getpid()))
+
+    def test_pgid_is_never_parsed_out_of_ps_output(self) -> None:
+        """The year in `lstart` must never be mistaken for a process group.
+
+        `lstart` ends in a four-digit year, so any rule of the form "the last
+        numeric field is the pgid" reads 2026 as a process group and produces a
+        well-formed token with a year where the discriminator belongs. The pgid
+        comes from os.getpgid instead, so this cannot happen.
+        """
+        completed = subprocess.CompletedProcess([], 0, "Fri Aug 14 18:01:16 2026", "")
+        with mock.patch("subprocess.run", return_value=completed):
+            token = _ps_token(os.getpid())
+        self.assertIsNotNone(token)
+        assert token is not None
+        self.assertIn("pgid:%d" % os.getpgid(os.getpid()), token)
+        self.assertNotIn("pgid:2026", token)
+
+    def test_subsecond_claim_matches_the_actual_token(self) -> None:
+        """token_is_subsecond() must describe the token this platform emits.
+
+        If it ever claimed sub-second while the ps fallback were in use, the
+        startup warning about the weaker guard would be suppressed on exactly
+        the platform that needs it.
+        """
+        proc = spawn_sleeper()
+        try:
+            token = process_start_token(proc.pid) or ""
+            if token_is_subsecond():
+                self.assertFalse(
+                    token.startswith("ps:"),
+                    "claims sub-second resolution but is using the ps fallback",
+                )
+            else:
+                self.assertTrue(token.startswith("ps:"))
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_nonexistent_and_invalid_pids_yield_none(self) -> None:
         for pid in (0, -1, 999999):

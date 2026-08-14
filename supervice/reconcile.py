@@ -177,25 +177,77 @@ def _ps_token(pid: int) -> str | None:
     The command column is excluded for the same reasons as on Linux: it is
     unstable after fork and rewritable by the process itself.
 
-    Microsecond start times are available via sysctl(KERN_PROC_PID) on Darwin
-    and FreeBSD and would be a better anchor. That is deliberately not used yet:
-    the kinfo_proc field offsets differ per platform and release, and shipping
-    struct offsets that have not been verified on the target would be exactly
-    the kind of unvalidated assumption this module exists to avoid.
+    Uses REPEATED -o flags rather than a comma-joined spec. `-o lstart=,pgid=`
+    is a GNU/Darwin extension; FreeBSD parses it as a SINGLE column named
+    "lstart" with the header string ",pgid=", so the pgid is never requested and
+    the token came out as the literal `ps:,pgid= Fri Aug 14 18:01:16 2026` --
+    identical for every process on the host that started in that second. That is
+    a wrong-kill door far wider than the one it was meant to leave. Repeated -o
+    is POSIX and works on all three platforms. (Found on FreeBSD 15.1 by
+    bikeroom-freebsd-operato-dd8bca.)
+
+    The output is now VALIDATED rather than trusted: the last field must be a
+    numeric pgid. A token that cannot be parsed returns None, so reconciliation
+    declines to act. The previous code accepted whatever ps printed and turned a
+    malformed command into a colliding identity -- a garbage token is worse than
+    no token, because no token fails closed and a garbage one collides.
+
+    Microsecond start times are available via sysctl(KERN_PROC_PID) on FreeBSD
+    and would be a better anchor; Darwin already uses that path. FreeBSD's
+    kinfo_proc layout has not been verified on a real host, so it is not
+    guessed here -- see the resolution note in `token_is_subsecond()`.
     """
+    # The pgid comes from a syscall, NOT from ps. Parsing it out of ps output is
+    # ambiguous in a way that bites: `lstart` ends in a four-digit year, so
+    # "take the last numeric field as the pgid" happily reads 2026 as a process
+    # group. That is precisely how the FreeBSD defect stayed invisible -- the
+    # token looked well-formed and carried a year where the discriminator should
+    # have been. os.getpgid has no such failure mode.
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return None
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart=,pgid="],
+            ["ps", "-p", str(pid), "-o", "lstart="],
             capture_output=True,
             text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    line = out.stdout.strip()
-    if out.returncode != 0 or not line:
+    if out.returncode != 0:
         return None
-    return "ps:%s" % " ".join(line.split())
+    lstart = " ".join(out.stdout.split())
+    # Reject anything carrying a format fragment: if a platform ever echoes the
+    # spec back instead of expanding it, that must fail closed rather than
+    # become part of an identity.
+    if not lstart or "=" in lstart:
+        return None
+    return "ps:%s pgid:%d" % (lstart, pgid)
+
+
+def token_is_subsecond() -> bool:
+    """Whether this platform's start token can distinguish same-second starts.
+
+    This is the property the recycling guard actually depends on. When a pid is
+    reused, the new holder has the SAME pid, and for a supervice child the same
+    pgid too (children are session leaders, so pgid == pid). Every component of
+    the token is therefore identical except the start time -- so if the start
+    time is only accurate to the second, two processes holding that pid a second
+    apart are indistinguishable and reconciliation could kill the wrong one.
+
+        Linux    /proc stat field 22, clock ticks  -> sub-second
+        Darwin   sysctl kinfo_proc, microseconds   -> sub-second
+        other    ps lstart, whole seconds          -> NOT sub-second
+
+    So on a platform falling back to ps there is a real same-second collision
+    window. It is narrow -- the pid must be recycled within the same second the
+    original started, which needs the pid space to wrap in under a second -- but
+    it is a wrong-kill rather than a missed kill, and it is stated rather than
+    left implicit.
+    """
+    return sys.platform == "linux" or sys.platform == "darwin"
 
 
 def process_start_token(pid: int) -> str | None:
