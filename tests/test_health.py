@@ -105,15 +105,67 @@ class TestTCPHealthChecker(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_dev_fd_counts_the_same_as_proc_self_fd(self) -> None:
+        """Validate the non-Linux branch of the fd-leak test, on Linux.
+
+        The /dev/fd fallback exists for Darwin and the BSDs, so without this it
+        would be code that only ever executes on a machine that is not running
+        CI. Linux has both directories, so the equivalence the fallback assumes
+        can be checked here rather than trusted.
+        """
+        import os
+
+        if not (os.path.isdir("/proc/self/fd") and os.path.isdir("/dev/fd")):
+            self.skipTest("this host does not have both directories to compare")
+
+        before_proc = len(os.listdir("/proc/self/fd"))
+        before_dev = len(os.listdir("/dev/fd"))
+        self.assertEqual(before_proc, before_dev)
+
+        # And both must MOVE together, or the equivalence is a coincidence of
+        # this moment rather than a property.
+        held = [open(os.devnull) for _ in range(5)]
+        try:
+            self.assertEqual(
+                len(os.listdir("/proc/self/fd")) - before_proc,
+                len(os.listdir("/dev/fd")) - before_dev,
+            )
+            self.assertGreaterEqual(len(os.listdir("/dev/fd")) - before_dev, 5)
+        finally:
+            for handle in held:
+                handle.close()
+
     def test_tcp_check_no_fd_leak_on_cancel(self) -> None:
-        """M4: cancelling an in-flight TCP check must not leak the socket fd."""
+        """M4: cancelling an in-flight TCP check must not leak the socket fd.
+
+        Runs on Darwin and the BSDs too, via /dev/fd, which has the same
+        semantics as /proc/self/fd for counting a process's own descriptors.
+        This previously skipped everywhere except Linux, so fd leaks in health
+        checks went unchecked on those platforms for entire release cycles.
+
+        The unskip was gated on proving the assertion can FAIL there first --
+        converting an honest skip ("not tested here") into a green that has
+        never been shown capable of red is strictly worse than the skip.
+        Demonstrated on Darwin 27.0.0 arm64 by macbook-admin-bd8e86 before this
+        landed:
+
+            BASE  before=4  after=4   delta=0   assertion PASS  (wanted PASS)
+            RED   before=4  after=34  delta=30  assertion FAIL  (wanted FAIL)
+            GREEN before=7  after=7   delta=0   assertion PASS  (wanted PASS)
+
+        The RED arm held 30 real sockets open and the assertion failed by
+        exactly 30.
+        """
 
         async def run() -> None:
             import os
 
-            fd_dir = "/proc/self/fd"
-            if not os.path.isdir(fd_dir):
-                self.skipTest("no /proc/self/fd on this platform")
+            for candidate in ("/proc/self/fd", "/dev/fd"):
+                if os.path.isdir(candidate):
+                    fd_dir = candidate
+                    break
+            else:
+                self.skipTest("no /proc/self/fd or /dev/fd on this platform")
 
             config = HealthCheckConfig(
                 type=HealthCheckType.TCP, port=9, host="10.255.255.1", timeout=30
