@@ -39,6 +39,11 @@ make the control chatty instead and let SIGPIPE kill it. See
 `sabotage_control()`, whose Darwin branch came from macbook-admin-bd8e86 after
 my recipe silently failed to bite on their machine.
 
+Run it on EVERY supported platform, not once. As the FreeBSD operator put it
+after their own valid result turned out to be valid by luck: a sabotage that
+does not bite everywhere makes "control verified" a claim about the platform you
+happened to run on, not about the harness.
+
 WHEN SENDING THIS TO ANOTHER PLATFORM RIG
 -----------------------------------------
 State what a WRONG result looks like, in advance, alongside the expected one.
