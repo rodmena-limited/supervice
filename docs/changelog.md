@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.4.0
+
+Correctness release for orphan handling, driven by cross-platform verification
+on Linux, FreeBSD 15.1 and macOS. The theme is that several guarantees were
+being *reported* rather than *delivered*, and none of the tests could have
+noticed.
+
+### Added
+
+- **`reconcile` program option** (`auto` | `kill` | `warn` | `off`, default
+  `auto`). At startup, before spawning anything, supervice checks the children
+  it recorded last run and acts on any still alive — killing by process group,
+  so it reaches the whole subtree.
+
+  This fixes duplicate workers after a supervisor crash: with no memory of what
+  it spawned, a restarting supervisor saw nothing running and started a second
+  copy alongside the first. Measured on macOS: four orphans became five across
+  a restart.
+
+  It is **not** a macOS-only fix. The kernel clears `pdeathsig` across `fork()`
+  on every platform, so the grandchildren of any forking program — a
+  pre-forking web server, a worker pool — were never covered on Linux or
+  FreeBSD either. `pdeathsig` and `reconcile` cover disjoint sets: one acts at
+  `kill -9` speed on the direct child, the other covers the whole tree at the
+  next start.
+
+  Records are an *identity* (`name`, `pid`, `pgid`, start token), never a bare
+  pid: the pid space wraps in minutes and reconciliation may run a week after
+  the crash. Every uncertain case declines to signal. `pdeathsig = false` is
+  honoured as the deliberate opt-out it is — the orphan is left alive, and the
+  duplicate it implies is warned about rather than silently created.
+
+- **`state_file` supervisor option** for the reconciliation record. Defaults
+  beside the pidfile, deliberately per-supervisor: concurrent daemons with
+  different configs must not share one, or one would kill another's children.
+
+### Fixed
+
+- **`pdeathsig` was only ever checked for *existence*, not function.**
+  `pdeathsig_supported()` tested that libc loaded; the `prctl`/`procctl` return
+  values were discarded, and ctypes does not raise on `-1`. On a host where the
+  syscall fails — a jail, a sandbox — the config said `pdeathsig = true`, no
+  warning was emitted, and children orphaned anyway. A startup probe now forks
+  a throwaway child, performs the real call, reads it back, and warns if it did
+  not take.
+
+- **Warning when a program's command is a setuid/setgid binary.** The kernel
+  clears the parent-death signal at exec for such images (measured on FreeBSD
+  15.1), so that program loses `pdeathsig` even where the host is fine. This is
+  per-command, so no host-wide probe can catch it. Does not affect the `user`
+  option, which uses `setuid(2)` before exec.
+
+- **Host-wide `pdeathsig` warnings are emitted once, not per program.** With
+  the default of `true`, a twenty-program config on macOS produced twenty
+  identical lines about a condition no per-program change could fix.
+
+### Changed
+
+- **Documentation corrected on two counts.** `installation.md` and `api.md`
+  still described `pdeathsig` as Linux-only, three releases after FreeBSD
+  support shipped. More seriously, the **one-generation limit** was recorded
+  only in an internal audit file: the guarantee covers the direct child and
+  never grandchildren. Now documented as two distinct situations — structural
+  (a forking server; no configuration fixes it) and accidental (a wrapper
+  script missing `exec`; one word fixes it).
+
+- The macOS `pkill -f` launcher snippet previously recommended in the README is
+  superseded by `reconcile`, and now carries the caveat that it matched on a
+  command string rather than identity.
+
+### Tests
+
+- **The orphan guarantee had never been tested end to end.** Every `pdeathsig`
+  test was a mock assertion against a fake libc or a check that a warning
+  string appeared; nothing killed a supervisor and asked whether a child died.
+  Two harnesses now do, with controls proven capable of failing on each
+  platform by a platform-appropriate sabotage.
+
+- Orphan tests must use a **silent** child: with a `stdout_logfile`, killing the
+  supervisor closes the pipe and `SIGPIPE` reaps a chatty child by accident, so
+  such a test passes whether or not `pdeathsig` works. The false-positive case
+  is kept beside the real one so it is not reintroduced.
+
+- The health-check fd-leak test now runs on macOS and the BSDs via `/dev/fd`
+  instead of skipping everywhere but Linux.
+
+- A scanner rejects `ps` invocations using comma-joined `-o` specs or `-e` for
+  "all processes" — both are GNU/Darwin forms that silently misbehave on
+  FreeBSD, and both had cost a real guard.
+
+Verified on Linux 6.14/x86_64, FreeBSD 15.1-RELEASE-p2/amd64 (privileged and
+unprivileged) and macOS 27.0/arm64: 162 collected, 0 failed on all three.
+
 ## 0.3.0
 
 Portability release driven by `PORTABILITY-FREEBSD.md` — field notes from
