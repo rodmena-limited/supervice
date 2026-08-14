@@ -237,6 +237,7 @@ def main() -> int:
     print("")
 
     results = []
+    conclusive = False
     for arm in selected:
         spec = ARMS[arm]
         r = run_arm(arm, **spec)  # type: ignore[arg-type]
@@ -266,8 +267,10 @@ def main() -> int:
                 "children - investigate before trusting any orphan result here."
             )
         elif not a.child_survived:
+            conclusive = True
             print("pdeathsig is FUNCTIONAL here: child died with it on, survived with it off.")
         else:
+            conclusive = True
             print(
                 "pdeathsig is NOT functional here: the child survived an abrupt\n"
                 "supervisor kill. Expected on macOS; a defect on Linux and FreeBSD."
@@ -275,11 +278,22 @@ def main() -> int:
 
     if "C" in by_arm and not by_arm["C"].error:
         c = by_arm["C"]
-        if not c.child_survived:
+        if not conclusive:
+            # Do not narrate past the point where we stopped being able to
+            # claim. Arm C only means something relative to the A/B verdict,
+            # and there isn't one.
+            print("\nARM C: not interpretable while the control is untrusted.")
+        elif not c.child_survived and by_arm["A"].child_survived:
             print(
-                "\nARM C died as expected. On a platform where arm A shows pdeathsig is\n"
-                "NOT functional, this is the SIGPIPE false positive: proof that a chatty\n"
-                "child with a logfile is reaped by accident and cannot test the guarantee."
+                "\nARM C died while ARM A survived. That is the SIGPIPE false positive\n"
+                "isolated on one machine: a chatty child with a logfile is reaped by\n"
+                "accident, so an orphan test built on one is green regardless of\n"
+                "whether pdeathsig works."
+            )
+        elif not c.child_survived:
+            print(
+                "\nARM C died, as did ARM A. Consistent with working pdeathsig; this run\n"
+                "does not separate it from the SIGPIPE path."
             )
         else:
             print("\nARM C survived - the SIGPIPE path did not fire; note the platform.")
