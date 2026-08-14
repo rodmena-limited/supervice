@@ -312,33 +312,36 @@ Notes for FreeBSD operators:
 ### macOS
 
 macOS has no kernel pdeathsig equivalent. `pdeathsig = true` is accepted but
-inactive, and supervice logs a warning at config load. If the supervisor is
-killed abruptly its children survive as orphans, and a later restart will spawn
-duplicates alongside them.
+inactive, and supervice logs one warning at config load naming the affected
+programs.
 
-If orphan reaping is essential today, a launcher can reap before exec'ing the
-supervisor:
+**What this means in practice.** There are two separate guarantees, and macOS
+has one of them:
 
-```sh
-pkill -u myuser -f 'myapp' || true
-exec supervice -c /etc/supervice.ini -n
-```
+| | Linux / FreeBSD | macOS |
+|---|---|---|
+| Child dies *when* the supervisor is killed | yes (`pdeathsig`, direct child only) | **no** |
+| Orphan is cleaned up at the *next* start | yes (`reconcile`) | yes (`reconcile`) |
 
-> **Know what this costs before you use it.** `pkill -f` matches on a command
-> string, not on identity. It will kill *any* process whose command line
-> matches — including one that merely looks similar, and including a process
-> that happens to be a different program entirely. There is no check that the
-> process is one supervice started. Scope the pattern as tightly as you can, and
-> prefer a dedicated user account so `-u` does real work.
->
-> Note also the `exec` on the last line: without it the supervisor would be a
-> child of this script, adding a generation. The same rule applies to your own
-> program wrappers — see
-> [`pdeathsig` scope](docs/configuration.md#pdeathsig-scope).
+So after an abrupt kill (`SIGKILL`, OOM, panic) the children keep running until
+you start supervice again. **That window is real and unbounded** — if the crash
+happens at 02:00 and nobody restarts until morning, a queue consumer keeps
+consuming for those hours. There is no kernel mechanism on macOS to close it;
+the honest mitigation is to make restarts fast and automatic (a `launchd`
+`KeepAlive` job), not to assume the gap is small.
 
-A supervisor-side replacement that matches on `{pid, pgid, start-time}` rather
-than on a command string is tracked as issue #12; until it lands, the snippet
-above is the available option and the caveat is real.
+What macOS *does* get is that the restart no longer makes it worse.
+Reconciliation identifies the orphans and kills them before spawning
+replacements, so a crash-restart cycle does not accumulate duplicate workers.
+Measured on Darwin arm64: without it, four orphans became five across a restart;
+with it, the count returns to one.
+
+This replaces the `pkill -u ... -f` launcher snippet previously recommended
+here, which matched on a command string rather than on identity and would kill
+any process whose command line merely looked similar. If you still use a
+launcher, note the `exec` — without it the supervisor is a child of the script,
+adding a generation. The same rule applies to your own program wrappers; see
+[`pdeathsig` scope](docs/configuration.md#pdeathsig-scope).
 
 **Testing orphan behaviour on macOS:** use a **silent** child. A program with a
 `stdout_logfile` is reaped by `SIGPIPE` when the supervisor dies — by accident,
