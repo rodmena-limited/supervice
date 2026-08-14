@@ -392,6 +392,42 @@ class TestStartToken(unittest.TestCase):
             proc.kill()
             proc.wait()
 
+    def test_subsecond_claim_is_measured_not_asserted(self) -> None:
+        """#14: the claim must follow the reader that actually ran.
+
+        Until 0.4.0 this asked sys.platform, which says which reader SHOULD
+        run, not which one DID. Both sysctl readers load libc via ctypes at
+        runtime and fall back to ps on any failure -- so a host where that load
+        failed used the coarse token AND suppressed the warning announcing it.
+        A guard quietly weaker than advertised is the thing this function
+        exists to prevent.
+        """
+        import supervice.reconcile as rec
+
+        original = rec._subsecond_cache
+        try:
+            # Reader working -> claim True.
+            rec._subsecond_cache = None
+            self.assertTrue(token_is_subsecond())
+
+            # Reader fails, ps fallback in use -> claim MUST drop to False.
+            rec._subsecond_cache = None
+            with mock.patch.object(rec, "_linux_token", return_value=None):
+                with mock.patch.object(rec, "_darwin_token", return_value=None):
+                    with mock.patch.object(rec, "_freebsd_token", return_value=None):
+                        token = process_start_token(os.getpid())
+                        self.assertIsNotNone(token)
+                        assert token is not None
+                        self.assertTrue(token.startswith("ps:"))
+                        self.assertFalse(token_is_subsecond())
+
+            # No token at all -> report the weaker answer, never over-claim.
+            rec._subsecond_cache = None
+            with mock.patch.object(rec, "process_start_token", return_value=None):
+                self.assertFalse(token_is_subsecond())
+        finally:
+            rec._subsecond_cache = original
+
     def test_subsecond_claim_matches_the_actual_token(self) -> None:
         """token_is_subsecond() must describe the token this platform emits.
 

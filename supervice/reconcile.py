@@ -292,8 +292,11 @@ def _ps_token(pid: int) -> str | None:
     return "ps:%s pgid:%d" % (lstart, pgid)
 
 
+_subsecond_cache: bool | None = None
+
+
 def token_is_subsecond() -> bool:
-    """Whether this platform's start token can distinguish same-second starts.
+    """Whether this host's start token can distinguish same-second starts.
 
     This is the property the recycling guard actually depends on. When a pid is
     reused, the new holder has the SAME pid, and for a supervice child the same
@@ -304,15 +307,26 @@ def token_is_subsecond() -> bool:
 
         Linux    /proc stat field 22, clock ticks  -> sub-second
         Darwin   sysctl kinfo_proc, microseconds   -> sub-second
-        other    ps lstart, whole seconds          -> NOT sub-second
+        fallback ps lstart, whole seconds          -> NOT sub-second
+        FreeBSD  sysctl kinfo_proc, microseconds   -> sub-second
 
-    So on a platform falling back to ps there is a real same-second collision
-    window. It is narrow -- the pid must be recycled within the same second the
-    original started, which needs the pid space to wrap in under a second -- but
-    it is a wrong-kill rather than a missed kill, and it is stated rather than
-    left implicit.
+    MEASURED, NOT ASSERTED. This asked `sys.platform` until 0.4.0, which is a
+    claim about which reader SHOULD run rather than which one DID. Both sysctl
+    readers load libc through ctypes at runtime and return None on any failure,
+    falling back to ps -- so on a host where that load fails, reconciliation
+    used the coarse token AND suppressed the warning saying the guard was
+    coarse. Exactly the silently-weaker-guard this function exists to announce.
+
+    Now it inspects a token this process actually produced. The answer cannot
+    disagree with the reader, because it is derived from it.
     """
-    return sys.platform in ("linux", "darwin") or sys.platform.startswith("freebsd")
+    global _subsecond_cache
+    if _subsecond_cache is None:
+        token = process_start_token(os.getpid())
+        # No token at all means we cannot establish resolution either; report
+        # the weaker answer, since over-claiming is the failure that matters.
+        _subsecond_cache = token is not None and not token.startswith("ps:")
+    return _subsecond_cache
 
 
 def process_start_token(pid: int) -> str | None:
