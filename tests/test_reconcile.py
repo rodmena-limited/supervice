@@ -33,6 +33,8 @@ from supervice.reconcile import (
     RECONCILE_WARN,
     ChildRecord,
     StateStore,
+    _darwin_token,
+    _freebsd_token,
     _ps_token,
     decide,
     process_start_token,
@@ -347,6 +349,48 @@ class TestStartToken(unittest.TestCase):
         assert token is not None
         self.assertIn("pgid:%d" % os.getpgid(os.getpid()), token)
         self.assertNotIn("pgid:2026", token)
+
+    def test_platform_readers_are_guarded_and_do_not_cross_apply(self) -> None:
+        """Each sysctl reader must decline off its own platform.
+
+        The Darwin and FreeBSD kinfo_proc layouts are unrelated -- 648/offset 0
+        against 1088/offset 336. A reader that ran on the wrong platform would
+        read the wrong bytes and return a plausible timestamp, which fails in
+        the wrong-kill direction rather than closed.
+        """
+        for reader, plat in ((_darwin_token, "darwin"), (_freebsd_token, "freebsd")):
+            with self.subTest(reader=reader.__name__):
+                if not sys.platform.startswith(plat):
+                    self.assertIsNone(reader(os.getpid()))
+
+    def test_token_prefix_identifies_the_source(self) -> None:
+        """The token must say which reader produced it.
+
+        Not cosmetic: a silent fall-back to ps is the failure mode that looks
+        exactly like success, so the prefix is how a platform rig can tell
+        'sub-second reader active' from 'reader returned None and nobody
+        noticed'.
+        """
+        proc = spawn_sleeper()
+        try:
+            token = process_start_token(proc.pid) or ""
+            expected = {
+                "linux": "starttime:",
+                "darwin": "darwin:",
+                "freebsd": "freebsd:",
+            }
+            for plat, prefix in expected.items():
+                if sys.platform.startswith(plat):
+                    self.assertTrue(
+                        token.startswith(prefix),
+                        "on %s expected a %r token, got %r" % (sys.platform, prefix, token),
+                    )
+                    break
+            else:
+                self.assertTrue(token.startswith("ps:"))
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_subsecond_claim_matches_the_actual_token(self) -> None:
         """token_is_subsecond() must describe the token this platform emits.

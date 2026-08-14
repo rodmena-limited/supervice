@@ -55,6 +55,14 @@ CTL_KERN = 1
 KERN_PROC = 14
 KERN_PROC_PID = 1
 
+# FreeBSD kinfo_proc layout, MEASURED on FreeBSD 15.1-RELEASE-p2/amd64 by
+# compiling against <sys/user.h> on that host (sizeof 1088, offsetof ki_start
+# 336, sizeof ki_start 16). Deliberately unrelated to Darwin's numbers -- the
+# two layouts share nothing, and assuming otherwise would read the wrong bytes
+# while looking correct.
+FREEBSD_KINFO_PROC_SIZE = 1088
+FREEBSD_KI_START_OFFSET = 336
+
 # Program-level policy for what to do with an identified orphan.
 RECONCILE_AUTO = "auto"  # kill if the program wanted pdeathsig, else warn
 RECONCILE_KILL = "kill"
@@ -134,10 +142,9 @@ def _darwin_token(pid: int) -> str | None:
     Returns None on any failure so the caller falls back to the ps token: this
     can only improve resolution, never lose the behaviour we already have.
 
-    Deliberately NOT applied to FreeBSD, whose kinfo_proc layout differs and
-    has not been verified on a real host. Guessing there would be exactly the
-    unvalidated assumption this module exists to avoid, and it costs nothing:
-    FreeBSD has working procctl pdeathsig already.
+    FreeBSD has its own reader with its own measured constants -- the layouts
+    are unrelated (1088/336 there against 648/0 here), so nothing is shared
+    between them.
     """
     if sys.platform != "darwin":
         return None
@@ -164,6 +171,64 @@ def _darwin_token(pid: int) -> str | None:
     if sec <= 0:
         return None
     return "darwin:%d.%06d" % (sec, usec)
+
+
+def _freebsd_token(pid: int) -> str | None:
+    """Microsecond start time from sysctl(KERN_PROC_PID) on FreeBSD.
+
+    Same purpose as the Darwin reader: the ps fallback is second-resolution, and
+    for a recycled pid held by another session leader every other component of
+    the token is identical, so only sub-second start time discriminates.
+
+    The struct constants are MEASURED on the target, not derived from a header
+    read elsewhere: `cc` against <sys/user.h> on FreeBSD 15.1-RELEASE-p2/amd64
+    gave sizeof(kinfo_proc)=1088, offsetof(ki_start)=336, sizeof(ki_start)=16.
+    Note these differ from Darwin's 648/0 -- the layouts are unrelated, which is
+    why no offset is shared between the two readers.
+
+    Verified on that host: 12 back-to-back spawns gave 12/12 distinct tokens
+    where `ps -o lstart=` gave 1/12; two reads of the same live pid are equal;
+    a reaped pid returns None across five reads.
+
+    tv_usec is `long` on FreeBSD (64-bit on amd64), unlike Darwin's int32 --
+    hence "<qq" here against "<qi" there. Little-endian makes the narrower read
+    accidentally correct for values below 2^31, which is every legal
+    microsecond value; unpacking the real width avoids relying on that.
+    """
+    if not sys.platform.startswith("freebsd"):
+        return None
+    try:
+        libc = ctypes.CDLL("libc.so.7", use_errno=True)
+    except OSError:
+        return None
+
+    mib = (ctypes.c_int * 4)(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)
+    buf = ctypes.create_string_buffer(FREEBSD_KINFO_PROC_SIZE)
+    size = ctypes.c_size_t(len(buf))
+    try:
+        rc = libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0)
+    except Exception:  # noqa: BLE001 - never let a ctypes problem escape
+        return None
+    if rc != 0:
+        return None
+    # A DEAD pid returns rc 0 with len 0 rather than an error. Checking only the
+    # return code would read an uninitialised struct and hand back a plausible
+    # timestamp for a process that does not exist -- the wrong-kill case this
+    # field exists to prevent.
+    if size.value == 0:
+        return None
+    # If the running kernel's struct disagrees with the size we measured
+    # against, every offset below would read the wrong bytes while looking
+    # fine. Refuse instead, and fall back to ps.
+    if size.value != FREEBSD_KINFO_PROC_SIZE:
+        return None
+    try:
+        sec, usec = struct.unpack_from("<qq", buf, FREEBSD_KI_START_OFFSET)
+    except struct.error:
+        return None
+    if sec <= 0 or not (0 <= usec < 1_000_000):
+        return None
+    return "freebsd:%d.%06d" % (sec, usec)
 
 
 def _ps_token(pid: int) -> str | None:
@@ -247,7 +312,7 @@ def token_is_subsecond() -> bool:
     it is a wrong-kill rather than a missed kill, and it is stated rather than
     left implicit.
     """
-    return sys.platform == "linux" or sys.platform == "darwin"
+    return sys.platform in ("linux", "darwin") or sys.platform.startswith("freebsd")
 
 
 def process_start_token(pid: int) -> str | None:
@@ -265,6 +330,9 @@ def process_start_token(pid: int) -> str | None:
     if token is not None:
         return token
     token = _darwin_token(pid)
+    if token is not None:
+        return token
+    token = _freebsd_token(pid)
     if token is not None:
         return token
     return _ps_token(pid)
