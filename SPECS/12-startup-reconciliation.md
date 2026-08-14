@@ -17,6 +17,8 @@
   **not** terminate its identified orphans.
 - If a recorded pid is alive but its start time does not match the record, then
   the supervisor shall not signal that process.
+- If the supervisor cannot read a process start time for a recorded pid, then
+  the supervisor shall not signal that process and shall log a warning.
 - If the state file is missing, unreadable or corrupt, then the supervisor
   shall log a warning and start normally without signalling anything.
 - The supervisor shall not adopt orphans into its process table.
@@ -79,9 +81,46 @@ The launcher workaround at `README.md:316` uses `pkill -u myuser -f 'myapp'` —
 pattern-matched on a command string, with exactly the PID-safety hole this spec
 forbids. Update that section when this lands.
 
-## Open question
+## Start-time source (resolved)
 
-Start-time granularity on Darwin: `ps -o lstart=` is second-resolution, thin as
-a PID-reuse guard where the pid space is small and recycles fast. Determine
-whether `kinfo_proc` via `sysctl(KERN_PROC_PID)` exposes microsecond start time.
-Linux uses `/proc/<pid>/stat` field 22.
+| Platform | Source | Resolution |
+|---|---|---|
+| Linux | `/proc/<pid>/stat` field 22 | clock ticks since boot |
+| Darwin | `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID)` → `kinfo_proc.kp_proc.p_starttime` | microseconds |
+| FreeBSD | `kinfo_proc` via sysctl (`ki_start`) | microseconds |
+
+**`ps -o lstart=` is unusable.** Measured on Darwin 27.0.0 arm64 over 12
+children spawned back to back: 1 distinct `tv_sec` out of 12, but 12 distinct
+`(sec, usec)` out of 12. Second resolution has *no* discriminating power on a
+spawn burst.
+
+Two further properties of the Darwin field, both measured:
+
+- A reaped pid makes the sysctl return size 0 — a clean "gone" signal with no
+  zombie ambiguity and no errno interpretation.
+- pid 1 (launchd) reports `p_starttime = (10, 401885)` — 1970-01-01 + 10s —
+  because launchd starts before the clock is set. The field is raw wall-clock at
+  spawn, **not** monotonic-since-boot and **not** sanitised. Comparing a
+  kernel-recorded value against the same kernel record later is safe; **do not
+  derive an age or elapsed time from it.**
+
+## PID reuse is not theoretical
+
+Measured on Darwin 27.0.0 arm64 (macbook-admin-bd8e86), `fork`/`_exit` — the
+cheapest possible spawn, establishing the adversarial floor:
+
+```
+kern.maxproc       = 12000
+kern.maxprocperuid = 8000
+sustained rate     = 140 spawns/sec
+41,962 spawns in 300s -> pid space WRAPPED (95799 -> ... -> 39694)
+```
+
+The pid space wraps in under five minutes of sustained spawning; a full cycle
+back to a specific pid is ~10–15 minutes at that rate. A parallel build, a test
+suite, or a CI runner does this incidentally. So a supervisor restarted more
+than ~10 minutes after a crash on a busy Mac can have a bare pid check match a
+completely unrelated live process.
+
+This is why the refusal test is blocking and why the reconciler fails closed
+rather than falling back to a pid-only match.
