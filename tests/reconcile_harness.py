@@ -52,19 +52,70 @@ def _live_pids(marker: str) -> list[int]:
     so asking the OS is the only answer worth having.
     """
     try:
+        # -A, not -e: on FreeBSD `-e` means "show the environment", NOT "all
+        # processes", so `ps -eo pid=,command=` returned 18 getty lines and the
+        # harness could not see its own child. Repeated -o rather than a
+        # comma-joined spec for the same reason -- FreeBSD reads everything
+        # after the first comma as the FIRST column's header, swallowing
+        # `command=` entirely. Both forms below are POSIX and work on Linux,
+        # FreeBSD and macOS. (Found by bikeroom-freebsd-operato-dd8bca.)
         out = subprocess.run(
-            ["ps", "-eo", "pid=,command="], capture_output=True, text=True, timeout=15
+            ["ps", "-A", "-o", "pid=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
         return []
     pids = []
     for line in out.stdout.splitlines():
-        if marker in line and "ps -eo" not in line:
-            try:
-                pids.append(int(line.split()[0]))
-            except (ValueError, IndexError):
-                continue
+        fields = line.split(None, 1)
+        if len(fields) != 2 or marker not in fields[1]:
+            continue
+        if fields[1].lstrip().startswith("ps "):
+            continue
+        try:
+            pids.append(int(fields[0]))
+        except ValueError:
+            continue
     return pids
+
+
+def detection_works() -> str | None:
+    """Prove _live_pids can see a process we KNOW exists. Returns an error or None.
+
+    Without this the harness reports "first supervisor never started a child"
+    when the truth is that its own `ps` invocation is blind -- which is exactly
+    what happened on FreeBSD, and which blames the product for a defect in the
+    measuring instrument. A detector that has never been shown finding anything
+    cannot be trusted to report an absence.
+    """
+    marker = "detectioncheck_%s" % uuid.uuid4().hex[:12]
+    with tempfile.TemporaryDirectory(prefix="supervice-detect-") as tmp:
+        script = os.path.join(tmp, "%s.py" % marker)
+        with open(script, "w") as f:
+            f.write(SILENT_CHILD)
+        sentinel = subprocess.Popen(
+            [sys.executable, "-u", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                found = _live_pids(marker)
+                if sentinel.pid in found:
+                    return None
+                time.sleep(0.2)
+            return (
+                "process detection is blind on this platform: spawned pid %d "
+                "carrying marker %s and `ps -A -o pid= -o command=` did not "
+                "report it. Every arm below would misreport as 'no child'."
+                % (sentinel.pid, marker)
+            )
+        finally:
+            sentinel.kill()
+            sentinel.wait(timeout=10)
 
 
 def _write_config(tmp: str, marker: str, *, pdeathsig: bool, reconcile: str) -> str:
@@ -205,6 +256,15 @@ def main() -> int:
     print("supervice reconciliation harness")
     print("platform : %s %s (%s)" % (platform.system(), platform.release(), platform.machine()))
     print("python   : %s" % platform.python_version())
+
+    # Validate the instrument before trusting it to report absence.
+    blind = detection_works()
+    if blind is not None:
+        print("")
+        print("ABORTED: %s" % blind)
+        print("This is a defect in the harness, NOT a result about supervice.")
+        return 2
+    print("detection: OK (verified against a known-live sentinel process)")
     print("")
 
     results = []
