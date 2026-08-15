@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.1
+
+Single fix: a guard that could be quietly weaker than it reported.
+
+### Fixed
+
+- **`token_is_subsecond()` asserted a platform instead of measuring the reader
+  that actually ran.** It returned a `sys.platform` test — a claim about which
+  start-time reader *should* run, not which one *did*. Both `sysctl` readers
+  load libc through ctypes at runtime and fall back to the `ps` token on any
+  failure, so on a host where that load fails, reconciliation used the coarse
+  second-resolution token **and suppressed the startup warning saying the guard
+  was coarse**.
+
+  That matters more than a wrong log line: the warning was the only thing
+  telling an operator they were exposed to the same-second pid-reuse window the
+  `sysctl` readers exist to close. No *new* wrong-kill risk is introduced — the
+  window is inherent to the fallback — but on such a host the existing risk
+  became **silent**, and the announcement was the compensating control.
+
+  The answer is now derived from a token this process actually produced, so it
+  cannot disagree with the reader. If no token can be read at all it reports the
+  weaker answer: over-claiming is the failure that matters here.
+
+  Found by verifying the published 0.4.0 *wheel* rather than the source tree,
+  and reproduced independently on Darwin and Linux by forcing the reader to
+  fail.
+
+### Tests
+
+- Both end-to-end harnesses now print **which** `supervice` they imported, and
+  whether it is an installed package or a source tree. An acceptance run against
+  a published artifact is worthless if the working directory shadows
+  `site-packages` and it silently exercises the checkout instead — a green
+  result for code that was never installed.
+
+Verified on Linux 6.14/x86_64: 163 passed, 0 failed, both harnesses green.
+
 ## 0.4.0
 
 Correctness release for orphan handling, driven by cross-platform verification
