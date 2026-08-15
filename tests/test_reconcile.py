@@ -404,29 +404,28 @@ class TestStartToken(unittest.TestCase):
         """
         import supervice.reconcile as rec
 
-        original = rec._subsecond_cache
-        try:
-            # Reader working -> claim True.
-            rec._subsecond_cache = None
-            self.assertTrue(token_is_subsecond())
+        # Reader working -> claim True.
+        self.assertTrue(token_is_subsecond())
 
-            # Reader fails, ps fallback in use -> claim MUST drop to False.
-            rec._subsecond_cache = None
-            with mock.patch.object(rec, "_linux_token", return_value=None):
-                with mock.patch.object(rec, "_darwin_token", return_value=None):
-                    with mock.patch.object(rec, "_freebsd_token", return_value=None):
-                        token = process_start_token(os.getpid())
-                        self.assertIsNotNone(token)
-                        assert token is not None
-                        self.assertTrue(token.startswith("ps:"))
-                        self.assertFalse(token_is_subsecond())
+        # Reader fails, ps fallback in use -> claim MUST drop to False.
+        with mock.patch.object(rec, "_linux_token", return_value=None):
+            with mock.patch.object(rec, "_darwin_token", return_value=None):
+                with mock.patch.object(rec, "_freebsd_token", return_value=None):
+                    token = process_start_token(os.getpid())
+                    self.assertIsNotNone(token)
+                    assert token is not None
+                    self.assertTrue(token.startswith("ps:"))
+                    self.assertFalse(token_is_subsecond())
 
-            # No token at all -> report the weaker answer, never over-claim.
-            rec._subsecond_cache = None
-            with mock.patch.object(rec, "process_start_token", return_value=None):
-                self.assertFalse(token_is_subsecond())
-        finally:
-            rec._subsecond_cache = original
+        # And it must come BACK once the reader recovers. A cached answer would
+        # not: it would keep reporting the state at first call forever, and the
+        # stale direction that matters is claiming sub-second after the reader
+        # began failing.
+        self.assertTrue(token_is_subsecond())
+
+        # No token at all -> report the weaker answer, never over-claim.
+        with mock.patch.object(rec, "process_start_token", return_value=None):
+            self.assertFalse(token_is_subsecond())
 
     def test_subsecond_claim_matches_the_actual_token(self) -> None:
         """token_is_subsecond() must describe the token this platform emits.

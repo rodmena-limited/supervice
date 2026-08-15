@@ -292,9 +292,6 @@ def _ps_token(pid: int) -> str | None:
     return "ps:%s pgid:%d" % (lstart, pgid)
 
 
-_subsecond_cache: bool | None = None
-
-
 def token_is_subsecond() -> bool:
     """Whether this host's start token can distinguish same-second starts.
 
@@ -319,14 +316,20 @@ def token_is_subsecond() -> bool:
 
     Now it inspects a token this process actually produced. The answer cannot
     disagree with the reader, because it is derived from it.
+
+    Deliberately NOT cached. A cached answer outlives the condition that
+    produced it, and the stale direction that matters is the unsafe one: a True
+    recorded while the reader worked would keep claiming sub-second after the
+    reader began failing, which is the exact defect this function was fixed to
+    remove, merely deferred. There is one caller and it runs once per daemon
+    start, so the cache bought a single token read and cost that guarantee.
+    (Shape flagged by macbook-admin-bd8e86, who noted they had measured only
+    the cold answer.)
     """
-    global _subsecond_cache
-    if _subsecond_cache is None:
-        token = process_start_token(os.getpid())
-        # No token at all means we cannot establish resolution either; report
-        # the weaker answer, since over-claiming is the failure that matters.
-        _subsecond_cache = token is not None and not token.startswith("ps:")
-    return _subsecond_cache
+    token = process_start_token(os.getpid())
+    # No token at all means we cannot establish resolution either; report the
+    # weaker answer, since over-claiming is the failure that matters.
+    return token is not None and not token.startswith("ps:")
 
 
 def process_start_token(pid: int) -> str | None:
