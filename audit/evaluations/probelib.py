@@ -110,18 +110,40 @@ def proc_alive(pid: int) -> bool:
 
 
 def pids_with_argv(argv: list[str]) -> list[int]:
-    """Pids whose full /proc cmdline is exactly argv. Observation only."""
-    want = "\x00".join(argv) + "\x00"
+    """Pids whose full command line is exactly argv. Observation only.
+
+    /proc where it exists; elsewhere (FreeBSD, macOS) `ps -A` with repeated
+    -o flags — comma-joined specs and -e are FreeBSD traps, see
+    tests/test_portability.py.
+    """
+    if os.path.isdir("/proc"):
+        want = "\x00".join(argv) + "\x00"
+        found = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % entry, "rb") as f:
+                    if f.read().decode("utf-8", "replace") == want:
+                        found.append(int(entry))
+            except OSError:
+                continue
+        return found
+    want_cmd = " ".join(argv)
+    try:
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
     found = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open("/proc/%s/cmdline" % entry, "rb") as f:
-                if f.read().decode("utf-8", "replace") == want:
-                    found.append(int(entry))
-        except OSError:
-            continue
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[1] == want_cmd and parts[0].isdigit():
+            found.append(int(parts[0]))
     return found
 
 
