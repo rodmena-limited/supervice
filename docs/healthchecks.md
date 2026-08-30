@@ -68,7 +68,8 @@ healthcheck_start_period = 15
    configured `user` (never as the possibly-root daemon)
 2. Waits up to `healthcheck_timeout` seconds for it to complete
 3. Exit code 0 = healthy, any other code = unhealthy
-4. If the script times out, it is killed and counts as a failure
+4. If the script times out, its whole process group is killed (the shell and
+   anything it forked) and the check counts as a failure
 
 ### Restart Policy
 

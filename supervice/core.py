@@ -9,12 +9,12 @@ from supervice.config import parse_config
 from supervice.events import Event, EventBus, EventType
 from supervice.logger import get_logger
 from supervice.models import HealthCheckType, ProgramConfig, SupervisorConfig
-from supervice.process import (
-    Process,
+from supervice.pdeathsig import (
     pdeathsig_functional,
     pdeathsig_supported,
     setuid_binary,
 )
+from supervice.process import Process
 from supervice.reconcile import (
     ChildRecord,
     StateStore,
@@ -39,6 +39,11 @@ class Supervisor:
         self._config_path: str = ""
         self._reload_lock = asyncio.Lock()
         self.state_store: StateStore | None = None
+        # True only once the pidfile lock and the RPC socket are both held.
+        # Until then another instance may own this config, and writing the
+        # (shared-path) state file would destroy ITS crash-recovery records —
+        # a failed duplicate start must leave no trace.
+        self._startup_committed = False
 
     def load_config(self, path: str) -> None:
         self.logger.info("Loading config from %s", path)
@@ -223,6 +228,7 @@ class Supervisor:
             # succeeded, so no other supervisor is alive for this config and
             # anything still recorded belongs to a dead instance. Running this
             # earlier could kill a live sibling's children.
+            self._startup_committed = True
             self._reconcile_orphans()
 
             # Record on state changes rather than once after startup:
@@ -232,6 +238,10 @@ class Supervisor:
             # entirely -- silently, since an empty state file looks exactly
             # like a clean shutdown.
             for event_type in (
+                # PROCESS_SPAWNED fires as soon as the child exists, closing
+                # the startsecs window during which a child would otherwise be
+                # unrecorded (RUNNING is only published after the gate).
+                EventType.PROCESS_SPAWNED,
                 EventType.PROCESS_STATE_RUNNING,
                 EventType.PROCESS_STATE_EXITED,
                 EventType.PROCESS_STATE_STOPPED,
@@ -327,7 +337,7 @@ class Supervisor:
 
     def _record_children(self) -> None:
         """Snapshot live children so the next start can find them. Never raises."""
-        if self.state_store is None:
+        if self.state_store is None or not self._startup_committed:
             return
         records = []
         for process in self.processes.values():

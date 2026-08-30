@@ -1,6 +1,8 @@
 """Health check implementations for process monitoring."""
 
 import asyncio
+import os
+import signal
 import socket
 from abc import ABC, abstractmethod
 
@@ -69,6 +71,23 @@ class TCPHealthChecker(HealthChecker):
 class ScriptHealthChecker(HealthChecker):
     """Health checker that runs a script and checks exit code."""
 
+    @staticmethod
+    def _kill_check_tree(proc: asyncio.subprocess.Process) -> None:
+        """SIGKILL the check's whole process group, falling back to the pid.
+
+        `sh -c` forks for anything non-trivial, so killing only the shell
+        leaks its children (a curl, a sleep) — one leaked grandchild per timed
+        out check, forever. The check is spawned as its own session leader, so
+        its pgid is its pid and the group is exactly the check's subtree.
+        """
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
     async def check(self) -> HealthCheckResult:
         if not self.config.command:
             return HealthCheckResult(False, "No command configured for script health check")
@@ -87,6 +106,9 @@ class ScriptHealthChecker(HealthChecker):
                 self.config.command,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                # Own session => own process group, so a timed-out or
+                # cancelled check can be killed as a whole subtree.
+                start_new_session=True,
                 **kwargs,  # type: ignore[arg-type]
             )
 
@@ -104,7 +126,7 @@ class ScriptHealthChecker(HealthChecker):
                         % (return_code, ": " + stderr_msg if stderr_msg else ""),
                     )
             except asyncio.TimeoutError:
-                proc.kill()
+                self._kill_check_tree(proc)
                 try:
                     await proc.wait()
                 except Exception:
@@ -112,6 +134,12 @@ class ScriptHealthChecker(HealthChecker):
                 return HealthCheckResult(
                     False, "Health check script timed out after %ds" % timeout
                 )
+            except BaseException:
+                # Covers cancellation (health task torn down mid-check, e.g.
+                # at shutdown): the in-flight check's subtree must die with
+                # it, not linger until its own commands finish.
+                self._kill_check_tree(proc)
+                raise
         except Exception as e:
             return HealthCheckResult(False, "Health check script error: %s" % e)
 

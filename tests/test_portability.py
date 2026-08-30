@@ -12,11 +12,11 @@ import unittest
 import unittest.mock as mock
 from contextlib import redirect_stdout
 
-import supervice.process as proc
+import supervice.pdeathsig as pd
 from supervice import __version__
 from supervice.config import ConfigValidationError, parse_config
 from supervice.core import Supervisor
-from supervice.process import (
+from supervice.pdeathsig import (
     P_PID,
     PR_SET_PDEATHSIG,
     PROC_PDEATHSIG_CTL,
@@ -66,8 +66,8 @@ class TestPdeathsigDispatch(unittest.TestCase):
     def test_linux_uses_prctl(self) -> None:
         libc = mock.MagicMock()
         with (
-            mock.patch.object(proc, "_LIBC", libc),
-            mock.patch.object(proc.sys, "platform", "linux"),
+            mock.patch.object(pd, "_LIBC", libc),
+            mock.patch.object(pd.sys, "platform", "linux"),
         ):
             _pdeathsig_preexec()
         libc.prctl.assert_called_once_with(PR_SET_PDEATHSIG, int(signal.SIGKILL))
@@ -75,8 +75,8 @@ class TestPdeathsigDispatch(unittest.TestCase):
     def test_freebsd_uses_procctl(self) -> None:
         libc = mock.MagicMock()
         with (
-            mock.patch.object(proc, "_LIBC", libc),
-            mock.patch.object(proc.sys, "platform", "freebsd15.1"),
+            mock.patch.object(pd, "_LIBC", libc),
+            mock.patch.object(pd.sys, "platform", "freebsd15.1"),
         ):
             _pdeathsig_preexec()
         libc.procctl.assert_called_once()
@@ -85,14 +85,14 @@ class TestPdeathsigDispatch(unittest.TestCase):
         self.assertIn("cparam 'P'", repr(args[3]))
 
     def test_no_libc_is_a_noop(self) -> None:
-        with mock.patch.object(proc, "_LIBC", None):
+        with mock.patch.object(pd, "_LIBC", None):
             _pdeathsig_preexec()  # must not raise
 
     def test_supported_flag(self) -> None:
-        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
-            self.assertTrue(proc.pdeathsig_supported())
-        with mock.patch.object(proc, "_LIBC", None):
-            self.assertFalse(proc.pdeathsig_supported())
+        with mock.patch.object(pd, "_LIBC", mock.MagicMock()):
+            self.assertTrue(pd.pdeathsig_supported())
+        with mock.patch.object(pd, "_LIBC", None):
+            self.assertFalse(pd.pdeathsig_supported())
 
 
 class TestPdeathsigFunctionalProbe(unittest.TestCase):
@@ -104,17 +104,17 @@ class TestPdeathsigFunctionalProbe(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        proc._pdeathsig_functional_cache = None
+        pd._pdeathsig_functional_cache = None
 
     def tearDown(self) -> None:
-        proc._pdeathsig_functional_cache = None
+        pd._pdeathsig_functional_cache = None
 
     @unittest.skipUnless(
         sys.platform == "linux" or sys.platform.startswith("freebsd"),
         "no parent-death-signal mechanism on this platform",
     )
     def test_green_on_a_working_host(self) -> None:
-        self.assertTrue(proc.pdeathsig_functional())
+        self.assertTrue(pd.pdeathsig_functional())
 
     @unittest.skipUnless(
         sys.platform == "linux" or sys.platform.startswith("freebsd"),
@@ -122,26 +122,26 @@ class TestPdeathsigFunctionalProbe(unittest.TestCase):
     )
     def test_probe_does_not_mutate_the_supervisor(self) -> None:
         """The supervisor must not acquire a parent-death signal of its own."""
-        before = proc._pdeathsig_get()
-        proc.pdeathsig_functional()
-        self.assertEqual(proc._pdeathsig_get(), before)
+        before = pd._pdeathsig_get()
+        pd.pdeathsig_functional()
+        self.assertEqual(pd._pdeathsig_get(), before)
 
     def test_red_when_the_set_syscall_fails(self) -> None:
         """The case that matters: supported, but the syscall does not work."""
-        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
-            with mock.patch.object(proc, "_pdeathsig_set", return_value=-1):
-                self.assertFalse(proc.pdeathsig_functional())
+        with mock.patch.object(pd, "_LIBC", mock.MagicMock()):
+            with mock.patch.object(pd, "_pdeathsig_set", return_value=-1):
+                self.assertFalse(pd.pdeathsig_functional())
 
     def test_red_when_readback_disagrees(self) -> None:
         """A set that claims success but does not stick is still a failure."""
-        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
-            with mock.patch.object(proc, "_pdeathsig_set", return_value=0):
-                with mock.patch.object(proc, "_pdeathsig_get", return_value=(0, 0)):
-                    self.assertFalse(proc.pdeathsig_functional())
+        with mock.patch.object(pd, "_LIBC", mock.MagicMock()):
+            with mock.patch.object(pd, "_pdeathsig_set", return_value=0):
+                with mock.patch.object(pd, "_pdeathsig_get", return_value=(0, 0)):
+                    self.assertFalse(pd.pdeathsig_functional())
 
     def test_red_when_libc_absent(self) -> None:
-        with mock.patch.object(proc, "_LIBC", None):
-            self.assertFalse(proc.pdeathsig_functional())
+        with mock.patch.object(pd, "_LIBC", None):
+            self.assertFalse(pd.pdeathsig_functional())
 
     def test_forks_at_most_once(self) -> None:
         """Counted on os.fork in the PARENT.
@@ -152,10 +152,10 @@ class TestPdeathsigFunctionalProbe(unittest.TestCase):
         the probe ran once, twice, or never.
         """
         real_fork = os.fork
-        with mock.patch.object(proc, "_LIBC", mock.MagicMock()):
-            with mock.patch.object(proc.os, "fork", side_effect=real_fork) as forked:
-                self.assertIsNotNone(proc.pdeathsig_functional())
-                self.assertIsNotNone(proc.pdeathsig_functional())
+        with mock.patch.object(pd, "_LIBC", mock.MagicMock()):
+            with mock.patch.object(pd.os, "fork", side_effect=real_fork) as forked:
+                self.assertIsNotNone(pd.pdeathsig_functional())
+                self.assertIsNotNone(pd.pdeathsig_functional())
         self.assertEqual(forked.call_count, 1, "probe must fork at most once")
 
 
@@ -169,7 +169,7 @@ class TestSetuidCommandDetection(unittest.TestCase):
     def test_ordinary_binaries_are_not_flagged(self) -> None:
         for command in ("%s -c pass" % sys.executable, "/bin/sleep 60"):
             with self.subTest(command=command):
-                self.assertIsNone(proc.setuid_binary(command))
+                self.assertIsNone(pd.setuid_binary(command))
 
     def test_setuid_binary_is_flagged(self) -> None:
         """Find a real setuid binary on this host, or skip honestly.
@@ -186,15 +186,15 @@ class TestSetuidCommandDetection(unittest.TestCase):
             except OSError:
                 continue
             if mode & (stat.S_ISUID | stat.S_ISGID):
-                self.assertEqual(proc.setuid_binary("%s --help" % candidate), path)
+                self.assertEqual(pd.setuid_binary("%s --help" % candidate), path)
                 return
         self.skipTest("no setuid binary on this host to test against")
 
     def test_unresolvable_command_is_not_flagged(self) -> None:
-        self.assertIsNone(proc.setuid_binary("definitely-not-a-real-binary-xyz"))
+        self.assertIsNone(pd.setuid_binary("definitely-not-a-real-binary-xyz"))
 
     def test_empty_command_is_not_flagged(self) -> None:
-        self.assertIsNone(proc.setuid_binary(""))
+        self.assertIsNone(pd.setuid_binary(""))
 
 
 class TestInactiveDirectiveWarning(unittest.TestCase):
@@ -215,7 +215,7 @@ pdeathsig = true
             sup = Supervisor()
             handler = capture_logs()
             try:
-                with mock.patch.object(proc, "_LIBC", None):
+                with mock.patch.object(pd, "_LIBC", None):
                     sup.load_config(path)
             finally:
                 release_logs(handler)
@@ -231,7 +231,7 @@ pdeathsig = true
             sup = Supervisor()
             handler = capture_logs()
             try:
-                with mock.patch.object(proc, "_LIBC", None):
+                with mock.patch.object(pd, "_LIBC", None):
                     sup.load_config(path)
             finally:
                 release_logs(handler)
@@ -253,8 +253,8 @@ pdeathsig = true
             handler = capture_logs()
             try:
                 with (
-                    mock.patch.object(proc, "_LIBC", mock.MagicMock()),
-                    mock.patch.object(proc, "_pdeathsig_functional_cache", True),
+                    mock.patch.object(pd, "_LIBC", mock.MagicMock()),
+                    mock.patch.object(pd, "_pdeathsig_functional_cache", True),
                 ):
                     sup.load_config(path)
             finally:
@@ -279,7 +279,7 @@ pdeathsig = true
             sup = Supervisor()
             handler = capture_logs()
             try:
-                with mock.patch.object(proc, "_LIBC", None):
+                with mock.patch.object(pd, "_LIBC", None):
                     sup.load_config(path)
             finally:
                 release_logs(handler)
@@ -300,8 +300,8 @@ pdeathsig = true
             handler = capture_logs()
             try:
                 with (
-                    mock.patch.object(proc, "_LIBC", mock.MagicMock()),
-                    mock.patch.object(proc, "_pdeathsig_functional_cache", False),
+                    mock.patch.object(pd, "_LIBC", mock.MagicMock()),
+                    mock.patch.object(pd, "_pdeathsig_functional_cache", False),
                 ):
                     sup.load_config(path)
             finally:

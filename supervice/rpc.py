@@ -61,7 +61,10 @@ class RPCServer:
             await self._write_message(writer, request)
             data = await asyncio.wait_for(self._read_message(reader), timeout=2.0)
             return "alive" if data is not None else "unknown"
-        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+            # ValueError: the occupant replied with a protocol-violating frame
+            # (e.g. an oversized length prefix). Whatever answered is not a
+            # supervice daemon we can judge — classify it, don't crash on it.
             return "unknown"
         finally:
             writer.close()
@@ -258,7 +261,9 @@ class RPCServer:
                 }
                 if proc.started_at is not None and is_alive:
                     proc_info["uptime"] = max(0, int(now - proc.started_at))
-                if proc.is_healthy is not None:
+                # Like uptime, a health verdict describes a live run only; a
+                # stopped process must not wear its previous run's OK.
+                if proc.is_healthy is not None and is_alive:
                     proc_info["healthy"] = proc.is_healthy
                 processes.append(proc_info)
             return {"status": "ok", "processes": processes}

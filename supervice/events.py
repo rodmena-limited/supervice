@@ -20,6 +20,10 @@ class EventType(Enum):
     PROCESS_STATE_FATAL = auto()
     PROCESS_STATE_UNKNOWN = auto()
     PROCESS_STATE_UNHEALTHY = auto()  # For health check failures
+    # Published the moment a child exists (before the startsecs gate), so the
+    # reconciliation snapshot covers the whole child lifetime — a supervisor
+    # killed inside the startsecs window must still know what it spawned.
+    PROCESS_SPAWNED = auto()
     HEALTHCHECK_PASSED = auto()
     HEALTHCHECK_FAILED = auto()
 

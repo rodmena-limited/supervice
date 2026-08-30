@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.4.2
+
+Seven fixes from a falsification audit (issuedb #15). Every one was first
+reproduced live against a running daemon, and every reproduction is preserved
+as a runnable probe under `audit/evaluations/` — `run_all.sh` re-checks all of
+them. The theme this round: failure in an auxiliary path (a second start, a
+log sink, a health probe) must never damage the primary job of keeping
+services alive and truthfully reported.
+
+### Fixed
+
+- **A failed duplicate start wiped the live instance's crash-recovery
+  state.** A second `supervice` on the same config is correctly refused by the
+  pidfile lock — but its shutdown path then snapshotted its own (empty)
+  process table into the shared state file, destroying the running sibling's
+  reconciliation records. If the sibling was later SIGKILLed, the next start
+  found an empty state file — indistinguishable from a clean shutdown — and
+  reconciled nothing, leaving orphans and spawning duplicates. State writes
+  are now gated on actually owning the pidfile lock and the RPC socket: a
+  start that never got that far leaves no trace.
+
+- **Children inside the `startsecs` window were invisible to
+  reconciliation.** The state snapshot was driven by the RUNNING event, which
+  only fires after the startup gate — so a supervisor killed while a child was
+  still STARTING had never recorded it. On hosts where reconciliation is the
+  only orphan cover (macOS, `pdeathsig=false`), that child became an
+  untracked duplicate on the next start. A new `PROCESS_SPAWNED` event now
+  fires the moment the child exists, and the supervisor records it then.
+  Reproduced end to end: SIGKILL mid-window, orphan survived, next start
+  reconciled it away.
+
+- **`supervicectl start` during BACKOFF silently served the residual backoff
+  delay** (up to 30 s): the supervise loop slept out the old retry timer even
+  though the operator had explicitly asked for a start, and the RPC reply
+  could report a state the process was no longer in. An explicit start now
+  wakes the loop; measured start-to-RUNNING during a 4 s backoff went from
+  5.0 s to 1.1 s.
+
+- **A timed-out script health check leaked the check's grandchildren.** Only
+  the `sh -c` shell was killed; anything it had forked (a `curl`, a `sleep`)
+  survived — one leaked process per timed-out check, forever. Checks now run
+  as their own session and are killed by process group, including when the
+  health task is torn down mid-check at shutdown.
+
+- **A broken child-log sink froze the supervised service.** If rotation
+  failed (log directory removed, disk error), the pump task died, nothing
+  read the child's pipe, and the child blocked in `write(2)` once the 64 KB
+  pipe filled — while `status` still said RUNNING. The pump now logs the
+  failure once and keeps draining (discarding output): a logging problem
+  degrades logging, never the service. Measured: the child kept full
+  throughput after `rm -rf` of its log directory.
+
+- **A garbage reply from a foreign occupant of the socket path crashed
+  startup** with an unhandled `ValueError` instead of the documented
+  "could not be verified as stale; refusing to replace it" refusal. Any
+  protocol-violating reply is now classified `unknown`.
+
+- **`status` showed a dead process wearing its previous run's health flag**
+  (`STOPPED` + `HEALTH OK`). Health, like uptime, is now reported only for a
+  live process, and a new spawn starts with an unknown verdict.
+
+### Internal
+
+- `supervice/process.py` shed two self-contained modules —
+  `supervice/pdeathsig.py` (platform parent-death-signal machinery) and
+  `supervice/childlog.py` (rotating child-log writer) — with behaviour
+  unchanged.
+
+Verified on Linux 6.14/x86_64: 171 tests, `mypy --strict`, `ruff`, and 7/7
+live probes green (`audit/evaluations/run_all.sh`).
+
 ## 0.4.1
 
 Single fix: a guard that could be quietly weaker than it reported.
