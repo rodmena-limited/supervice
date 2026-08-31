@@ -68,7 +68,8 @@ services alive and truthfully reported.
   `supervice/childlog.py` (rotating child-log writer) — with behaviour
   unchanged.
 
-Verified on Linux 6.14/x86_64: 171 tests, `mypy --strict`, `ruff`, and 7/7
+Verified on Linux 6.14/x86_64 (Python 3.13) and FreeBSD 15.1-RELEASE-p2
+(Python 3.12, independent rig): 171 tests, `mypy --strict`, `ruff`, and 7/7
 live probes green (`audit/evaluations/run_all.sh`).
 
 ## 0.4.1
