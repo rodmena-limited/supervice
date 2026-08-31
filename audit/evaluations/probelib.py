@@ -109,14 +109,36 @@ def proc_alive(pid: int) -> bool:
         return True
 
 
+def _procfs_sees_us() -> bool:
+    """Trust /proc only after it reproduces THIS process's own cmdline.
+
+    A /proc directory is not a procfs: FreeBSD ships a bare /proc mountpoint
+    with nothing mounted, so isdir("/proc") is True while listdir is empty —
+    and a counter branching on that returns [] forever, turning every
+    absence assertion into a false pass. Found live on FreeBSD 15.1 by
+    bikeroom-freebsd-operato-b124c2 (issuedb #15 thread). A reader that has
+    never seen a known positive may not be used to assert absence.
+    Mirrored in tests/test_audit_round2.py, which cannot import this file
+    (the sdist ships tests/ but not audit/).
+    """
+    try:
+        with open("/proc/%d/cmdline" % os.getpid(), "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    # Linux-style procfs NUL-separates argv; anything else falls back to ps.
+    return b"\x00" in data
+
+
 def pids_with_argv(argv: list[str]) -> list[int]:
     """Pids whose full command line is exactly argv. Observation only.
 
-    /proc where it exists; elsewhere (FreeBSD, macOS) `ps -A` with repeated
-    -o flags — comma-joined specs and -e are FreeBSD traps, see
+    Linux-style /proc when it demonstrably works (see _procfs_sees_us);
+    otherwise (FreeBSD — mounted or stub /proc — and macOS) `ps -A` with
+    repeated -o flags — comma-joined specs and -e are FreeBSD traps, see
     tests/test_portability.py.
     """
-    if os.path.isdir("/proc"):
+    if _procfs_sees_us():
         want = "\x00".join(argv) + "\x00"
         found = []
         for entry in os.listdir("/proc"):

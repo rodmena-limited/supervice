@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -28,18 +29,53 @@ def _write(path: str, body: str) -> None:
         f.write(body)
 
 
+def _procfs_sees_us() -> bool:
+    """Trust /proc only after it reproduces THIS process's own cmdline.
+
+    FreeBSD ships a bare /proc mountpoint with nothing mounted: isdir is
+    True, listdir is empty, and a counter that trusts it returns [] forever —
+    turning the absence assertions below into false passes. Mirrors
+    audit/evaluations/probelib.py (not importable here: the sdist ships
+    tests/ but not audit/). Found live on FreeBSD 15.1.
+    """
+    try:
+        with open("/proc/%d/cmdline" % os.getpid(), "rb") as f:
+            return b"\x00" in f.read()
+    except OSError:
+        return False
+
+
 def _pids_with_argv(argv: list[str]) -> list[int]:
-    want = "\x00".join(argv) + "\x00"
+    if _procfs_sees_us():
+        want = "\x00".join(argv) + "\x00"
+        found = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % entry, "rb") as f:
+                    if f.read().decode("utf-8", "replace") == want:
+                        found.append(int(entry))
+            except OSError:
+                continue
+        return found
+    # FreeBSD/macOS: repeated -o and -A, never comma-joined specs or -e
+    # (see tests/test_portability.py for why).
+    want_cmd = " ".join(argv)
+    try:
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
     found = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open("/proc/%s/cmdline" % entry, "rb") as f:
-                if f.read().decode("utf-8", "replace") == want:
-                    found.append(int(entry))
-        except OSError:
-            continue
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[1] == want_cmd and parts[0].isdigit():
+            found.append(int(parts[0]))
     return found
 
 
@@ -196,13 +232,19 @@ class TestHealthScriptTimeoutKillsSubtree(unittest.TestCase):
         marker = ["sleep", "87.65"]
 
         async def scenario() -> None:
-            result = await self._checker("sleep 87.65 & wait").check()
+            # Presence first: an absence assertion from a counter that has
+            # never seen the grandchild alive proves nothing (a blind counter
+            # made this a false pass on FreeBSD's stub /proc).
+            task = asyncio.create_task(self._checker("sleep 87.65 & wait").check())
+            appeared = await _wait_for(lambda: _pids_with_argv(marker), timeout=3)
+            self.assertTrue(appeared, "check subtree never observed — counter blind?")
+            result = await task
             self.assertFalse(result.healthy)
             self.assertIn("timed out", result.message)
-            survivors = await _wait_for(
+            gone = await _wait_for(
                 lambda: not _pids_with_argv(marker) or None, timeout=2
             )
-            self.assertTrue(survivors, "grandchild leaked: %s" % _pids_with_argv(marker))
+            self.assertTrue(gone, "grandchild leaked: %s" % _pids_with_argv(marker))
 
         asyncio.run(scenario())
 
